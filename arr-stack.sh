@@ -58,6 +58,8 @@ declare -A APP
 
 SELECTED_ARRS=""
 SELECTED_CLIENTS=""
+SELECTED_MEDIA=""
+EXAMPLE_INDEXER=""
 ORDERED_SLUGS=()
 INSTALLED_SLUGS=()
 WIRING_RESULTS=()
@@ -140,7 +142,9 @@ prowlarr|prowlarr.sh|9696||v1|indexer|Prowlarr|
 sonarr|sonarr.sh|8989|Sonarr|v3|arr|Sonarr|SonarrSettings
 radarr|radarr.sh|7878|Radarr|v3|arr|Radarr|RadarrSettings
 lidarr|lidarr.sh|8686|Lidarr|v1|arr|Lidarr|LidarrSettings
+bazarr|bazarr.sh|6767|Bazarr|-|arr|Bazarr|BazarrSettings
 seerr|seerr.sh|5055||-|requests|Seerr|
+jellyfin|jellyfin.sh|8096|Jellyfin|-|media|Jellyfin|
 qbittorrent|qbittorrent.sh|8090|QBittorrent|-|client|qBittorrent|QBittorrentSettings
 sabnzbd|sabnzbd.sh|7777|Sabnzbd|-|client|SABnzbd|SabnzbdSettings
 EOF
@@ -240,10 +244,11 @@ pick_apps() {
     local choice
     choice=$(whiptail --backtitle "$BACKTITLE" \
       --title "Pick *arr Apps" \
-      --checklist "Prowlarr is always installed. Pick additional apps:" 16 70 6 \
+      --checklist "Prowlarr is always installed. Pick additional apps:" 18 70 7 \
       "sonarr" "Sonarr (TV)" ON \
       "radarr" "Radarr (Movies)" ON \
       "lidarr" "Lidarr (Music)" OFF \
+      "bazarr" "Bazarr (Subtitles)" OFF \
       "seerr"  "Seerr (Requests)" OFF \
       3>&1 1>&2 2>&3) || cancelled "*arr app pick"
 
@@ -270,6 +275,25 @@ pick_clients() {
     3>&1 1>&2 2>&3) || cancelled "download client pick"
 
   SELECTED_CLIENTS=$(echo "$choice" | tr -d '"')
+}
+
+pick_jellyfin() {
+  local choice
+  choice=$(whiptail --backtitle "$BACKTITLE" \
+    --title "Media Server" \
+    --yesno "Install Jellyfin (media player/server)?" 10 70 && echo "jellyfin" || echo "")
+
+  if [[ "$choice" == "jellyfin" ]]; then
+    SELECTED_MEDIA="jellyfin"
+  fi
+}
+
+pick_example_indexer() {
+  if whiptail --backtitle "$BACKTITLE" \
+    --title "Example Indexer" \
+    --yesno "Add example public indexer to Prowlarr?\n\n⚠ WARNING: Public indexers can contain malicious content.\nIt will be DISABLED by default. You must verify and enable manually." 13 70; then
+    EXAMPLE_INDEXER="yes"
+  fi
 }
 
 _gen_password() {
@@ -334,6 +358,7 @@ compute_ordered_slugs() {
   for s in $SELECTED_ARRS; do
     [[ "$s" == "seerr" ]] && ORDERED_SLUGS+=("seerr")
   done
+  [[ -n "$SELECTED_MEDIA" ]] && ORDERED_SLUGS+=("$SELECTED_MEDIA")
 }
 
 pick_ip_mode_and_ips() {
@@ -909,6 +934,9 @@ wait_and_extract_keys() {
       requests)
         msg_warn "Seerr requires the web first-run wizard. URL + keys will be in the summary."
         ;;
+      media)
+        msg_info "${s} installed and listening on ${ip}:${port}"
+        ;;
     esac
   done
 }
@@ -947,6 +975,38 @@ probe_lidarr_api_version() {
     APP[lidarr.apiver]="v3"
     msg_info "Lidarr supports /api/v3 — using v3 for wiring."
   fi
+}
+
+add_example_indexer_to_prowlarr() {
+  [[ "$EXAMPLE_INDEXER" != "yes" ]] && return
+
+  local prowlarr_ip="${APP[prowlarr.ip]}"
+  local prowlarr_key="${APP[prowlarr.apikey]:-}"
+  if [[ -z "$prowlarr_key" ]]; then
+    record_failure "Example indexer (1337x)  FAIL (no prowlarr apikey)"
+    return 1
+  fi
+
+  local payload
+  payload=$(jq -n \
+    --arg name "1337x" \
+    --arg baseUrl "https://1337x.to" \
+    '{
+      enable: false,
+      priority: 50,
+      name: $name,
+      implementation: "Torrent1337x",
+      implementationName: "1337x",
+      configContract: "Torrent1337xSettings",
+      tags: [],
+      fields: [
+        { name: "baseUrl", value: $baseUrl }
+      ]
+    }')
+
+  api_post "http://${prowlarr_ip}:9696/api/v1/indexer?forceSave=true" \
+    "$prowlarr_key" "$payload" \
+    "Prowlarr example indexer (1337x, DISABLED)" || true
 }
 
 wire_arrs_into_prowlarr() {
@@ -1089,6 +1149,7 @@ wire_clients_into_arrs() {
 wire_apis() {
   msg_step "Wiring apps together via HTTP APIs"
   probe_lidarr_api_version
+  add_example_indexer_to_prowlarr
   wire_arrs_into_prowlarr
   wire_clients_into_arrs
 
@@ -1135,6 +1196,9 @@ write_summary() {
       client)
         if [[ "$s" == "qbittorrent" ]]; then
           lines+=( "$(printf '  %-12s user:   \e[32m%s\e[0m' "$s" "${APP[qbittorrent.user]:-admin}")" )
+          if [[ -n "${APP[qbittorrent.pass]:-}" ]]; then
+            lines+=( "$(printf '  %-12s pass:   \e[32m%s\e[0m' "" "${APP[qbittorrent.pass]}")" )
+          fi
         elif [[ "$s" == "sabnzbd" ]]; then
           if [[ -n "${APP[sabnzbd.apikey]:-}" ]]; then
             lines+=( "$(printf '  %-12s apikey: \e[32m%s\e[0m' "$s" "${APP[sabnzbd.apikey]}")" )
@@ -1145,6 +1209,9 @@ write_summary() {
         ;;
       requests)
         lines+=( "$(printf '  %-12s \e[33m(set during first-run web wizard)\e[0m' "$s")" )
+        ;;
+      media)
+        lines+=( "$(printf '  %-12s \e[33m(set during first-run web wizard at http://%s:%s)\e[0m' "$s" "${APP[$s.ip]}" "${APP[$s.port]}")" )
         ;;
     esac
   done
@@ -1159,6 +1226,15 @@ write_summary() {
   fi
   lines+=( "" )
 
+  if [[ "$EXAMPLE_INDEXER" == "yes" ]]; then
+    lines+=( "\e[1;33m[⚠ Example Indexer Added]\e[0m" )
+    lines+=( "  An example public indexer (1337x) was added to Prowlarr as DISABLED." )
+    lines+=( "  \e[31mWARNING: Public indexers can contain malicious content.\e[0m" )
+    lines+=( "  Before enabling it, verify it is a legitimate indexer you trust." )
+    lines+=( "  To enable: Prowlarr → Settings → Indexers → 1337x → Enable" )
+    lines+=( "" )
+  fi
+
   if (( ${#WIRING_FAILURES[@]} > 0 )); then
     lines+=( "\e[1;31m[Wiring failures]\e[0m" )
     local f
@@ -1170,8 +1246,14 @@ write_summary() {
   lines+=( "\e[1;31m------------------------------------------------------------\e[0m" )
   lines+=( "  - \e[1mProwlarr:\e[0m Add indexers (none ship by default)." )
   lines+=( "  - \e[1mSonarr/Radarr/Lidarr:\e[0m Set root folders and at least one quality profile." )
+  if [[ " $SELECTED_ARRS " == *" bazarr "* ]]; then
+    lines+=( "  - \e[1mBazarr:\e[0m Open \e[4mhttp://${APP[bazarr.ip]}:6767\e[0m and configure subtitle languages." )
+  fi
   if [[ " $SELECTED_CLIENTS " == *" sabnzbd "* ]]; then
     lines+=( "  - \e[1mSABnzbd:\e[0m Open \e[4mhttp://${APP[sabnzbd.ip]}:7777\e[0m and complete the web wizard." )
+  fi
+  if [[ " $SELECTED_MEDIA " == *" jellyfin "* ]]; then
+    lines+=( "  - \e[1mJellyfin:\e[0m Open \e[4mhttp://${APP[jellyfin.ip]}:8096\e[0m and complete the setup wizard, configure library paths." )
   fi
   if [[ " $SELECTED_ARRS " == *" seerr "* ]]; then
     lines+=( "  - \e[1mSeerr:\e[0m Open \e[4mhttp://${APP[seerr.ip]}:5055\e[0m, complete the wizard, then add:" )
@@ -1208,7 +1290,9 @@ main() {
   pick_network_defaults
   pick_apps
   pick_clients
+  pick_jellyfin
   pick_qbittorrent_password
+  pick_example_indexer
   compute_ordered_slugs
   pick_ip_mode_and_ips
   pick_start_ctid

@@ -8,14 +8,12 @@ A Proxmox VE helper script to automate deployment and configuration of a basic c
 - **Sonarr** (TV)
 - **Radarr** (movies)
 - **Lidarr** (music)
+- **Bazarr** (subtitles)
 - **Seerr** (requests)
 - **qBittorrent** (Torrent Client)
 - **SABnzbd** (Usenet client)
-- **Requests Welcome!** Open a discussion to make a request or open a PR with your edits 
-
-### Needs testing
 - **Jellyfin** (Media Player)
-- **Bazarr** (subs)
+- **Requests Welcome!** Open a discussion to make a request or open a PR with your edits
 
 Derived from [@michelroegl-brunner's](https://github.com/michelroegl-brunner) original community script idea. 
 
