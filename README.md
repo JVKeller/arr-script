@@ -1,4 +1,4 @@
-# arr-stack: Proxmox VE Media Automation Provisioner
+# arr-stack: ProxmoxVE Helper Script Automated Media Server Builder
 
 A Proxmox VE helper script to automate deployment and configuration of a basic containerized media automation stack focusing on automated API wiring, credential extraction, and simplified operator experience for self-hosted media libraries.
 
@@ -12,7 +12,6 @@ A Proxmox VE helper script to automate deployment and configuration of a basic c
 - **Seerr** (requests)
 - **qBittorrent** (Torrent Client)
 - **SABnzbd** (Usenet client)
-- **Jellyfin** (Media Player)
 - **Requests Welcome!** Open a discussion to make a request or open a PR with your edits
 
 Derived from [@michelroegl-brunner's](https://github.com/michelroegl-brunner) original community script idea. 

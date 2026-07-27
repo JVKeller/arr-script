@@ -1146,12 +1146,57 @@ wire_clients_into_arrs() {
   done
 }
 
+wire_bazarr_into_arrs() {
+  [[ " $SELECTED_ARRS " != *" bazarr "* ]] && return
+
+  local bazarr_ip="${APP[bazarr.ip]:-}"
+  local bazarr_key="${APP[bazarr.apikey]:-}"
+  if [[ -z "$bazarr_ip" ]] || [[ -z "$bazarr_key" ]]; then
+    msg_warn "Skipping Bazarr wiring — missing IP or API key."
+    return
+  fi
+
+  local arr arr_key arr_ip arr_port api_ver url payload
+  for arr in $SELECTED_ARRS; do
+    [[ "$arr" == "seerr" || "$arr" == "bazarr" ]] && continue
+    arr_key="${APP[$arr.apikey]:-}"
+    if [[ -z "$arr_key" ]]; then
+      record_failure "${APP[$arr.name]} -> Bazarr  FAIL (no apikey)"
+      continue
+    fi
+    arr_ip="${APP[$arr.ip]}"
+    arr_port="${APP[$arr.port]}"
+    api_ver="${APP[$arr.apiver]}"
+
+    url="http://${arr_ip}:${arr_port}/api/${api_ver}/notification?forceSave=true"
+
+    payload=$(jq -n \
+      --arg name "Bazarr" \
+      --arg baseUrl "http://${bazarr_ip}:6767" \
+      '{
+        enable: true, priority: 1,
+        name: $name,
+        implementation: "Webhook",
+        implementationName: "Webhook",
+        configContract: "WebhookSettings",
+        tags: [],
+        fields: [
+          { name: "url", value: ($baseUrl + "/api/webhooks/series/wanted-cutoff") }
+        ]
+      }')
+
+    api_post "$url" "$arr_key" "$payload" \
+      "${APP[$arr.name]} -> Bazarr" || true
+  done
+}
+
 wire_apis() {
   msg_step "Wiring apps together via HTTP APIs"
   probe_lidarr_api_version
   add_example_indexer_to_prowlarr
   wire_arrs_into_prowlarr
   wire_clients_into_arrs
+  wire_bazarr_into_arrs
 
   if [[ " $SELECTED_ARRS " == *" seerr "* ]]; then
     record_wiring "Seerr -> (manual via web wizard)"
@@ -1247,7 +1292,8 @@ write_summary() {
   lines+=( "  - \e[1mProwlarr:\e[0m Add indexers (none ship by default)." )
   lines+=( "  - \e[1mSonarr/Radarr/Lidarr:\e[0m Set root folders and at least one quality profile." )
   if [[ " $SELECTED_ARRS " == *" bazarr "* ]]; then
-    lines+=( "  - \e[1mBazarr:\e[0m Open \e[4mhttp://${APP[bazarr.ip]}:6767\e[0m and configure subtitle languages." )
+    lines+=( "  - \e[1mBazarr:\e[0m Open \e[4mhttp://${APP[bazarr.ip]}:6767\e[0m, configure subtitle providers & languages." )
+    lines+=( "         (Webhook notifications are auto-wired. Add connection to each arr app in Bazarr settings if desired.)" )
   fi
   if [[ " $SELECTED_CLIENTS " == *" sabnzbd "* ]]; then
     lines+=( "  - \e[1mSABnzbd:\e[0m Open \e[4mhttp://${APP[sabnzbd.ip]}:7777\e[0m and complete the web wizard." )
