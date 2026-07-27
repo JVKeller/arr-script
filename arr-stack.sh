@@ -35,6 +35,19 @@ var_repo="${var_repo:-ProxmoxVE}"
 var_qbt_password="${var_qbt_password:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-/root/arr-stack-summary.txt}"
 
+var_share_host="${var_share_host:-}"
+var_share_name="${var_share_name:-}"
+var_share_user="${var_share_user:-}"
+var_share_pass="${var_share_pass:-}"
+var_share_domain="${var_share_domain:-}"
+var_share_guest="${var_share_guest:-0}"
+
+MEDIA_SHARE_ENABLED=0
+HOST_MOUNTPOINT="${HOST_MOUNTPOINT:-/mnt/arr-data}"
+CT_MOUNTPOINT="${CT_MOUNTPOINT:-/mnt/data}"
+SHARE_CRED_FILE="${SHARE_CRED_FILE:-/etc/arr-stack/media-share.cred}"
+MOUNTED_SLUGS=()
+
 QBT_PERMANENT=0
 
 BACKTITLE="Proxmox VE Helper Scripts — arr Stack"
@@ -128,7 +141,10 @@ form_input_program() {
 }
 
 seed_catalog() {
-  while IFS='|' read -r slug script port impl apiver kind name contract; do
+  # Trailing field "storage" marks apps that read/write media files and therefore
+  # need the shared folder bind-mounted. Prowlarr (indexer proxy) and Seerr
+  # (request UI) never touch files, so they are deliberately left unmounted.
+  while IFS='|' read -r slug script port impl apiver kind name contract storage; do
     [[ -z "$slug" ]] && continue
     APP[$slug.script]="$script"
     APP[$slug.port]="$port"
@@ -137,16 +153,17 @@ seed_catalog() {
     APP[$slug.kind]="$kind"
     APP[$slug.name]="$name"
     APP[$slug.contract]="$contract"
+    APP[$slug.storage]="$storage"
   done <<'EOF'
-prowlarr|prowlarr.sh|9696||v1|indexer|Prowlarr|
-sonarr|sonarr.sh|8989|Sonarr|v3|arr|Sonarr|SonarrSettings
-radarr|radarr.sh|7878|Radarr|v3|arr|Radarr|RadarrSettings
-lidarr|lidarr.sh|8686|Lidarr|v1|arr|Lidarr|LidarrSettings
-bazarr|bazarr.sh|6767|Bazarr|-|arr|Bazarr|BazarrSettings
-seerr|seerr.sh|5055||-|requests|Seerr|
-jellyfin|jellyfin.sh|8096|Jellyfin|-|media|Jellyfin|
-qbittorrent|qbittorrent.sh|8090|QBittorrent|-|client|qBittorrent|QBittorrentSettings
-sabnzbd|sabnzbd.sh|7777|Sabnzbd|-|client|SABnzbd|SabnzbdSettings
+prowlarr|prowlarr.sh|9696||v1|indexer|Prowlarr||0
+sonarr|sonarr.sh|8989|Sonarr|v3|arr|Sonarr|SonarrSettings|1
+radarr|radarr.sh|7878|Radarr|v3|arr|Radarr|RadarrSettings|1
+lidarr|lidarr.sh|8686|Lidarr|v1|arr|Lidarr|LidarrSettings|1
+bazarr|bazarr.sh|6767|Bazarr|-|arr|Bazarr|BazarrSettings|1
+seerr|seerr.sh|5055||-|requests|Seerr||0
+jellyfin|jellyfin.sh|8096|Jellyfin|-|media|Jellyfin||1
+qbittorrent|qbittorrent.sh|8090|QBittorrent|-|client|qBittorrent|QBittorrentSettings|1
+sabnzbd|sabnzbd.sh|7777|Sabnzbd|-|client|SABnzbd|SabnzbdSettings|1
 EOF
 }
 
@@ -288,6 +305,137 @@ pick_jellyfin() {
   fi
 }
 
+_share_unc() { printf '//%s/%s' "$var_share_host" "$var_share_name"; }
+
+# Common CIFS options. Files land as root:root inside an unprivileged CT
+# (host 100000 == container 0) and are mounted world-writable so each app's
+# non-root service user can write without any in-container group setup.
+_share_mount_opts() {
+  local extra="uid=100000,gid=100000,file_mode=0666,dir_mode=0777"
+  if (( var_share_guest == 1 )); then
+    printf 'guest,%s' "$extra"
+  else
+    printf 'credentials=%s,%s' "$1" "$extra"
+  fi
+}
+
+_write_cred_file() {
+  local dest=$1
+  (
+    umask 077
+    {
+      printf 'username=%s\n' "$var_share_user"
+      printf 'password=%s\n' "$var_share_pass"
+      # Must be an if, not `[[ ]] &&`: a false trailing test would return 1
+      # from the group and trip `set -e`.
+      if [[ -n "$var_share_domain" ]]; then
+        printf 'domain=%s\n' "$var_share_domain"
+      fi
+    } > "$dest"
+  )
+  chmod 600 "$dest" 2>/dev/null || true
+}
+
+# Mounts the share into a scratch directory, proves it is writable, unmounts.
+# Echoes mount.cifs stderr on failure so the user sees the real reason.
+_probe_share() {
+  local probe="$TEMP_DIR/probe" cred="$TEMP_DIR/probe.cred" err rc=0
+  mkdir -p "$probe"
+
+  if (( var_share_guest != 1 )); then
+    _write_cred_file "$cred"
+  fi
+
+  err=$(mount -t cifs "$(_share_unc)" "$probe" \
+    -o "$(_share_mount_opts "$cred")" 2>&1) || rc=$?
+
+  if (( rc != 0 )); then
+    rm -f "$cred"
+    printf '%s' "${err:-mount failed with status ${rc}}"
+    return 1
+  fi
+
+  if ! touch "$probe/.arr-stack-write-test" 2>/dev/null; then
+    umount "$probe" 2>/dev/null || true
+    rm -f "$cred"
+    printf 'Share mounted read-only: cannot create files in %s' "$(_share_unc)"
+    return 1
+  fi
+
+  rm -f "$probe/.arr-stack-write-test"
+  umount "$probe" 2>/dev/null || true
+  rm -f "$cred"
+  return 0
+}
+
+pick_media_share() {
+  whiptail --backtitle "$BACKTITLE" \
+    --title "Shared Storage" \
+    --yesno "Set up a shared network folder (SMB/CIFS) for media and downloads?\n\nIt will be mounted on this node and bind-mounted into every container that touches files. Choosing No leaves storage entirely up to you." 14 74 \
+    || { msg_info "No shared storage — apps will use their own container disks."; return; }
+
+  ensure_dependencies cifs-utils
+
+  while true; do
+    var_share_host=$(whiptail --backtitle "$BACKTITLE" \
+      --title "Share Server" \
+      --inputbox "Hostname or IPv4 address of the SMB/CIFS server:" 10 70 \
+      "$var_share_host" 3>&1 1>&2 2>&3) || cancelled "share server prompt"
+
+    if [[ -z "$var_share_host" ]]; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+        --msgbox "Server cannot be empty." 8 60
+      continue
+    fi
+
+    var_share_name=$(whiptail --backtitle "$BACKTITLE" \
+      --title "Share Name" \
+      --inputbox "Share name on ${var_share_host} (no leading slash, e.g. media):" 10 70 \
+      "$var_share_name" 3>&1 1>&2 2>&3) || cancelled "share name prompt"
+
+    var_share_name="${var_share_name#/}"
+    var_share_name="${var_share_name%/}"
+    if [[ -z "$var_share_name" ]]; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+        --msgbox "Share name cannot be empty." 8 60
+      continue
+    fi
+
+    if whiptail --backtitle "$BACKTITLE" --title "Share Credentials" \
+      --yesno "Does ${var_share_host}/${var_share_name} require a username and password?" 10 70; then
+      var_share_guest=0
+      var_share_user=$(whiptail --backtitle "$BACKTITLE" --title "Share Username" \
+        --inputbox "Username:" 10 60 "$var_share_user" 3>&1 1>&2 2>&3) \
+        || cancelled "share username prompt"
+      var_share_pass=$(whiptail --backtitle "$BACKTITLE" --title "Share Password" \
+        --passwordbox "Password:" 10 60 3>&1 1>&2 2>&3) \
+        || cancelled "share password prompt"
+      var_share_domain=$(whiptail --backtitle "$BACKTITLE" --title "Share Domain" \
+        --inputbox "Domain/workgroup (leave blank if none):" 10 60 \
+        "$var_share_domain" 3>&1 1>&2 2>&3) || cancelled "share domain prompt"
+    else
+      var_share_guest=1
+      var_share_user=""; var_share_pass=""; var_share_domain=""
+    fi
+
+    msg_info "Testing access to $(_share_unc)..."
+    local err
+    if err=$(_probe_share); then
+      msg_ok "Share is reachable and writable."
+      MEDIA_SHARE_ENABLED=1
+      return
+    fi
+
+    if ! whiptail --backtitle "$BACKTITLE" --title "Share Test Failed" \
+      --yes-button "Re-enter" --no-button "Skip Storage" \
+      --yesno "Could not use $(_share_unc):\n\n${err}\n\nRe-enter the share details, or continue without shared storage?" 18 74; then
+      msg_warn "Continuing without shared storage."
+      MEDIA_SHARE_ENABLED=0
+      return
+    fi
+  done
+}
+
 pick_example_indexer() {
   if whiptail --backtitle "$BACKTITLE" \
     --title "Example Indexer" \
@@ -359,6 +507,8 @@ compute_ordered_slugs() {
     [[ "$s" == "seerr" ]] && ORDERED_SLUGS+=("seerr")
   done
   [[ -n "$SELECTED_MEDIA" ]] && ORDERED_SLUGS+=("$SELECTED_MEDIA")
+  # A false trailing [[ ]] && would return 1 and trip `set -e` in main.
+  return 0
 }
 
 pick_ip_mode_and_ips() {
@@ -662,8 +812,14 @@ confirm_summary() {
 
   local body="About to create these containers and wire them together:"$'\n\n'"${lines}"$'\n'"Storage: ${var_container_storage} | Bridge: ${var_bridge} | Gateway: ${var_gateway} | Mask: /${var_cidr}"
 
+  if (( MEDIA_SHARE_ENABLED == 1 )); then
+    body+=$'\n\n'"Shared folder: $(_share_unc)"
+    body+=$'\n'"  mounted on this node at ${HOST_MOUNTPOINT}"
+    body+=$'\n'"  bind-mounted into containers at ${CT_MOUNTPOINT}"
+  fi
+
   whiptail --backtitle "$BACKTITLE" --title "Confirm" \
-    --yesno "$body" 22 78 || { msg_warn "User cancelled."; exit 0; }
+    --yesno "$body" 26 78 || { msg_warn "User cancelled."; exit 0; }
 }
 
 orphan_report() {
@@ -673,6 +829,86 @@ orphan_report() {
   for s in "${INSTALLED_SLUGS[@]}"; do
     echo "  pct stop ${APP[$s.ctid]} && pct destroy ${APP[$s.ctid]}   # ${s}"
   done
+}
+
+_fstab_escape() { printf '%s' "${1// /\\040}"; }
+
+_make_tree() {
+  local -a dirs=("${HOST_MOUNTPOINT}/media")
+
+  [[ " $SELECTED_ARRS " == *" sonarr "* ]] && dirs+=("${HOST_MOUNTPOINT}/media/tv")
+  [[ " $SELECTED_ARRS " == *" radarr "* ]] && dirs+=("${HOST_MOUNTPOINT}/media/movies")
+  [[ " $SELECTED_ARRS " == *" lidarr "* ]] && dirs+=("${HOST_MOUNTPOINT}/media/music")
+
+  if [[ -n "$SELECTED_CLIENTS" ]]; then
+    dirs+=("${HOST_MOUNTPOINT}/downloads/incomplete" "${HOST_MOUNTPOINT}/downloads/complete")
+    [[ " $SELECTED_ARRS " == *" sonarr "* ]] && dirs+=("${HOST_MOUNTPOINT}/downloads/complete/tv-sonarr")
+    [[ " $SELECTED_ARRS " == *" radarr "* ]] && dirs+=("${HOST_MOUNTPOINT}/downloads/complete/radarr")
+    [[ " $SELECTED_ARRS " == *" lidarr "* ]] && dirs+=("${HOST_MOUNTPOINT}/downloads/complete/lidarr")
+  fi
+
+  local d
+  for d in "${dirs[@]}"; do
+    mkdir -p "$d" || { msg_error "Could not create ${d} on the share."; return 1; }
+  done
+  msg_ok "Created folder structure on the share."
+}
+
+setup_media_share() {
+  (( MEDIA_SHARE_ENABLED == 1 )) || return 0
+  msg_step "Setting up shared storage"
+
+  if (( var_share_guest != 1 )); then
+    mkdir -p "$(dirname "$SHARE_CRED_FILE")"
+    chmod 700 "$(dirname "$SHARE_CRED_FILE")" 2>/dev/null || true
+    _write_cred_file "$SHARE_CRED_FILE"
+    msg_ok "Wrote credentials to ${SHARE_CRED_FILE} (chmod 600)."
+  fi
+
+  mkdir -p "$HOST_MOUNTPOINT"
+
+  # _netdev,nofail matter: without them an unreachable NAS blocks this node's boot.
+  local fstab_line
+  fstab_line=$(printf '%s\t%s\tcifs\t%s,_netdev,nofail\t0\t0' \
+    "$(_fstab_escape "$(_share_unc)")" \
+    "$(_fstab_escape "$HOST_MOUNTPOINT")" \
+    "$(_share_mount_opts "$SHARE_CRED_FILE")")
+
+  local existing
+  existing=$(awk -v mp="$(_fstab_escape "$HOST_MOUNTPOINT")" \
+    '!/^[[:space:]]*#/ && $2 == mp {print; exit}' /etc/fstab 2>/dev/null || true)
+
+  if [[ -z "$existing" ]]; then
+    printf '\n# arr-stack shared media storage\n%s\n' "$fstab_line" >> /etc/fstab
+    msg_ok "Added ${HOST_MOUNTPOINT} to /etc/fstab."
+  elif [[ "$existing" == "$fstab_line" ]]; then
+    msg_info "/etc/fstab already has a matching entry for ${HOST_MOUNTPOINT}."
+  else
+    if whiptail --backtitle "$BACKTITLE" --title "Existing fstab Entry" \
+      --yes-button "Replace" --no-button "Keep Existing" \
+      --yesno "/etc/fstab already mounts ${HOST_MOUNTPOINT}:\n\n${existing}\n\nReplace it with the new entry?\n\n${fstab_line}" 18 78; then
+      cp /etc/fstab "/etc/fstab.arr-stack.bak"
+      grep -vxF "$existing" /etc/fstab > "$TEMP_DIR/fstab.new" && cat "$TEMP_DIR/fstab.new" > /etc/fstab
+      printf '\n# arr-stack shared media storage\n%s\n' "$fstab_line" >> /etc/fstab
+      msg_ok "Replaced fstab entry (backup: /etc/fstab.arr-stack.bak)."
+    else
+      msg_warn "Keeping the existing /etc/fstab entry for ${HOST_MOUNTPOINT}."
+    fi
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if ! mountpoint -q "$HOST_MOUNTPOINT"; then
+    local err rc=0
+    err=$(mount "$HOST_MOUNTPOINT" 2>&1) || rc=$?
+    if (( rc != 0 )) || ! mountpoint -q "$HOST_MOUNTPOINT"; then
+      msg_error "Failed to mount ${HOST_MOUNTPOINT}: ${err:-unknown error}"
+      exit 1
+    fi
+  fi
+  msg_ok "Mounted $(_share_unc) at ${HOST_MOUNTPOINT}."
+
+  _make_tree || exit 1
 }
 
 install_loop() {
@@ -735,6 +971,75 @@ install_loop() {
 
   for s in "${ORDERED_SLUGS[@]}"; do
     msg_ok "Installed ${s}"
+  done
+}
+
+_next_mp_index() {
+  local ctid=$1 i
+  for ((i=0; i<256; i++)); do
+    if ! pct config "$ctid" 2>/dev/null | grep -q "^mp${i}:"; then
+      printf '%s' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_wait_ct_running() {
+  local ctid=$1 timeout=${2:-120} elapsed=0
+  while true; do
+    [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]] && return 0
+    sleep 2
+    elapsed=$((elapsed + 2))
+    (( elapsed >= timeout )) && return 1
+  done
+}
+
+# Must run after install_loop: needs APP[$slug.ctid], which only exists once
+# the containers have been created.
+attach_media_share() {
+  (( MEDIA_SHARE_ENABLED == 1 )) || return 0
+  msg_step "Mounting shared storage into containers"
+
+  local s ctid idx
+  for s in "${ORDERED_SLUGS[@]}"; do
+    [[ "${APP[$s.storage]:-0}" == "1" ]] || continue
+    ctid="${APP[$s.ctid]}"
+
+    if pct config "$ctid" 2>/dev/null | grep -q "mp=${CT_MOUNTPOINT}\(,\|$\)"; then
+      msg_info "${s} already has ${CT_MOUNTPOINT} mounted."
+      MOUNTED_SLUGS+=("$s")
+      record_wiring "Storage -> ${APP[$s.name]}  (already present)"
+      continue
+    fi
+
+    if ! idx=$(_next_mp_index "$ctid"); then
+      record_failure "Storage -> ${APP[$s.name]}  FAIL (no free mount point slot)"
+      continue
+    fi
+
+    if ! pct set "$ctid" "-mp${idx}" "${HOST_MOUNTPOINT},mp=${CT_MOUNTPOINT}" >>"$SILENT_LOGFILE" 2>&1; then
+      record_failure "Storage -> ${APP[$s.name]}  FAIL (pct set mp${idx})"
+      msg_warn "Could not add mount point to ${s} (ctid ${ctid})."
+      continue
+    fi
+
+    # A mount point added to a running container does not appear until restart.
+    pct reboot "$ctid" >>"$SILENT_LOGFILE" 2>&1 || true
+    if ! _wait_ct_running "$ctid" 120; then
+      record_failure "Storage -> ${APP[$s.name]}  FAIL (container did not come back up)"
+      msg_warn "${s} (ctid ${ctid}) did not return to running after reboot."
+      continue
+    fi
+
+    if pct exec "$ctid" -- mountpoint -q "$CT_MOUNTPOINT" >/dev/null 2>&1; then
+      MOUNTED_SLUGS+=("$s")
+      record_wiring "Storage -> ${APP[$s.name]} (${CT_MOUNTPOINT})"
+      msg_ok "${s}: ${CT_MOUNTPOINT} mounted."
+    else
+      record_failure "Storage -> ${APP[$s.name]}  FAIL (${CT_MOUNTPOINT} not mounted after reboot)"
+      msg_warn "${s}: ${CT_MOUNTPOINT} did not appear after reboot."
+    fi
   done
 }
 
@@ -1262,6 +1567,26 @@ write_summary() {
   done
   lines+=( "" )
 
+  if (( MEDIA_SHARE_ENABLED == 1 )); then
+    lines+=( "\e[1;33m[Media share]\e[0m" )
+    lines+=( "  Share:      $(_share_unc)" )
+    lines+=( "  On node:    ${HOST_MOUNTPOINT}  (persisted in /etc/fstab)" )
+    lines+=( "  In CTs:     ${CT_MOUNTPOINT}" )
+    if (( var_share_guest == 1 )); then
+      lines+=( "  Auth:       guest (no credentials)" )
+    else
+      lines+=( "  Auth:       credentials in ${SHARE_CRED_FILE} (chmod 600)" )
+    fi
+    if (( ${#MOUNTED_SLUGS[@]} > 0 )); then
+      lines+=( "  Mounted in: ${MOUNTED_SLUGS[*]}" )
+    else
+      lines+=( "  \e[31mMounted in: (none)\e[0m" )
+    fi
+    lines+=( "  \e[33mNote: mounted 0777/0666 — every process in those containers can" )
+    lines+=( "        read and write the entire share.\e[0m" )
+    lines+=( "" )
+  fi
+
   lines+=( "\e[1;33m[Wired automatically]\e[0m" )
   if (( ${#WIRING_RESULTS[@]} == 0 )); then
     lines+=( "  (nothing)" )
@@ -1290,7 +1615,30 @@ write_summary() {
   lines+=( "\e[1;41;37m !!! MANUAL STEPS STILL REQUIRED !!! \e[0m" )
   lines+=( "\e[1;31m------------------------------------------------------------\e[0m" )
   lines+=( "  - \e[1mProwlarr:\e[0m Add indexers (none ship by default)." )
-  lines+=( "  - \e[1mSonarr/Radarr/Lidarr:\e[0m Set root folders and at least one quality profile." )
+  if (( MEDIA_SHARE_ENABLED == 1 )); then
+    lines+=( "  - \e[1mSet these paths in each app\e[0m (the folders already exist):" )
+    [[ " $SELECTED_ARRS " == *" sonarr "* ]] && \
+      lines+=( "       Sonarr  root folder    \e[36m${CT_MOUNTPOINT}/media/tv\e[0m" )
+    [[ " $SELECTED_ARRS " == *" radarr "* ]] && \
+      lines+=( "       Radarr  root folder    \e[36m${CT_MOUNTPOINT}/media/movies\e[0m" )
+    [[ " $SELECTED_ARRS " == *" lidarr "* ]] && \
+      lines+=( "       Lidarr  root folder    \e[36m${CT_MOUNTPOINT}/media/music\e[0m" )
+    if [[ " $SELECTED_CLIENTS " == *" qbittorrent "* ]]; then
+      lines+=( "       qBittorrent save path  \e[36m${CT_MOUNTPOINT}/downloads/complete\e[0m" )
+      lines+=( "       qBittorrent temp path  \e[36m${CT_MOUNTPOINT}/downloads/incomplete\e[0m" )
+    fi
+    if [[ " $SELECTED_CLIENTS " == *" sabnzbd "* ]]; then
+      lines+=( "       SABnzbd complete dir   \e[36m${CT_MOUNTPOINT}/downloads/complete\e[0m" )
+      lines+=( "       SABnzbd incomplete dir \e[36m${CT_MOUNTPOINT}/downloads/incomplete\e[0m" )
+    fi
+    [[ -n "$SELECTED_MEDIA" ]] && \
+      lines+=( "       Jellyfin libraries     \e[36m${CT_MOUNTPOINT}/media/{tv,movies,music}\e[0m" )
+    lines+=( "    \e[33mKeep downloads and media on this one share — moving either off it" )
+    lines+=( "    turns every import into a full file copy instead of a hardlink.\e[0m" )
+    lines+=( "  - \e[1mSonarr/Radarr/Lidarr:\e[0m Also set at least one quality profile." )
+  else
+    lines+=( "  - \e[1mSonarr/Radarr/Lidarr:\e[0m Set root folders and at least one quality profile." )
+  fi
   if [[ " $SELECTED_ARRS " == *" bazarr "* ]]; then
     lines+=( "  - \e[1mBazarr:\e[0m Open \e[4mhttp://${APP[bazarr.ip]}:6767\e[0m, configure subtitle providers & languages." )
     lines+=( "         (Webhook notifications are auto-wired. Add connection to each arr app in Bazarr settings if desired.)" )
@@ -1337,13 +1685,16 @@ main() {
   pick_apps
   pick_clients
   pick_jellyfin
+  pick_media_share
   pick_qbittorrent_password
   pick_example_indexer
   compute_ordered_slugs
   pick_ip_mode_and_ips
   pick_start_ctid
   confirm_summary
+  setup_media_share
   install_loop
+  attach_media_share
   wait_and_extract_keys
   wire_apis
   write_summary
