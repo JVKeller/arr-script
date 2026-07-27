@@ -359,6 +359,8 @@ compute_ordered_slugs() {
     [[ "$s" == "seerr" ]] && ORDERED_SLUGS+=("seerr")
   done
   [[ -n "$SELECTED_MEDIA" ]] && ORDERED_SLUGS+=("$SELECTED_MEDIA")
+  # A false trailing [[ ]] && would return 1 and trip `set -e` in main.
+  return 0
 }
 
 pick_ip_mode_and_ips() {
