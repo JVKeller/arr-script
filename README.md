@@ -2,8 +2,8 @@
 
 A Proxmox VE helper script to automate deployment and configuration of a basic containerized media automation stack focusing on automated API wiring, credential extraction, and simplified operator experience for self-hosted media libraries.
 
-What is Included:
-## Working
+##What is Included:
+### Working
 - **Prowlarr** (indexers)
 - **Sonarr** (TV)
 - **Radarr** (movies)
@@ -13,7 +13,7 @@ What is Included:
 - **SABnzbd** (Usenet client)
 - **Requests Welcome!** Open a discussion to make a request or open a PR with your edits 
 
-## Needs testing
+### Needs testing
 - **Jellyfin** (Media Player)
 - **Bazarr** (subs)
 
@@ -84,10 +84,7 @@ This script is **one-time provisioning only** — it is not designed to be re-ru
 
 However, each container can be updated independently via its own ProxmoxVE helper script:
 
-```bash
-# Update a single container (e.g., sonarr)
-bash <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/sonarr.sh)
-```
+Open the terminal on the container you want to update and simply type `update`
 
 Each *arr container script is separately maintained by the community-scripts project and can be updated without affecting others.
 
@@ -116,4 +113,4 @@ Derived from [community-scripts](https://github.com/community-scripts/ProxmoxVE)
 
 ## Support
 
-See `/tmp/arr-stack-$$.log` for debugging output from failed deployments.
+When requesting help, include the log file from your pve server `/tmp/arr-stack-$$.log` for debugging output from failed deployments.
