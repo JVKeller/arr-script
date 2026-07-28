@@ -54,6 +54,15 @@ _on_exit() {
 }
 trap _on_exit EXIT
 
+# `set -e` aborts silently, which makes a failure look like a clean exit.
+# -E (already set above) propagates this into functions so the message names
+# the actual failing line and command.
+_on_err() {
+  local rc=$? line=$1 cmd=$2
+  msg_error "Aborted at line ${line} (exit ${rc}): ${cmd}"
+}
+trap '_on_err "$LINENO" "$BASH_COMMAND"' ERR
+
 declare -A APP
 
 SELECTED_ARRS=""
