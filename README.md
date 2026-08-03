@@ -96,7 +96,7 @@ enter the paths yourself. The exact strings are printed in the summary's manual-
 To use this version, manually download to your PVE host and run it.
 
 ```bash
-bash -c "$(curl -fsSL https://github.com/JVKeller/arr-script/blob/main/arr-stack.sh)"
+curl -fsSL https://raw.githubusercontent.com/JVKeller/arr-script/main/arr-stack.sh -o arr-stack.sh
 bash arr-stack.sh
 ```
 

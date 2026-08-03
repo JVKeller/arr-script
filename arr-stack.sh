@@ -67,6 +67,15 @@ _on_exit() {
 }
 trap _on_exit EXIT
 
+# `set -e` aborts silently, which makes a failure look like a clean exit.
+# -E (already set above) propagates this into functions so the message names
+# the actual failing line and command.
+_on_err() {
+  local rc=$? line=$1 cmd=$2
+  msg_error "Aborted at line ${line} (exit ${rc}): ${cmd}"
+}
+trap '_on_err "$LINENO" "$BASH_COMMAND"' ERR
+
 declare -A APP
 
 SELECTED_ARRS=""
@@ -295,12 +304,11 @@ pick_clients() {
 }
 
 pick_jellyfin() {
-  local choice
-  choice=$(whiptail --backtitle "$BACKTITLE" \
+  # whiptail draws its UI on stdout, so this must not be captured in a
+  # command substitution or the dialog is never painted to the terminal.
+  if whiptail --backtitle "$BACKTITLE" \
     --title "Media Server" \
-    --yesno "Install Jellyfin (media player/server)?" 10 70 && echo "jellyfin" || echo "")
-
-  if [[ "$choice" == "jellyfin" ]]; then
+    --yesno "Install Jellyfin (media player/server)?" 10 70; then
     SELECTED_MEDIA="jellyfin"
   fi
 }
