@@ -287,12 +287,11 @@ pick_clients() {
 }
 
 pick_jellyfin() {
-  local choice
-  choice=$(whiptail --backtitle "$BACKTITLE" \
+  # whiptail draws its UI on stdout, so this must not be captured in a
+  # command substitution or the dialog is never painted to the terminal.
+  if whiptail --backtitle "$BACKTITLE" \
     --title "Media Server" \
-    --yesno "Install Jellyfin (media player/server)?" 10 70 && echo "jellyfin" || echo "")
-
-  if [[ "$choice" == "jellyfin" ]]; then
+    --yesno "Install Jellyfin (media player/server)?" 10 70; then
     SELECTED_MEDIA="jellyfin"
   fi
 }
