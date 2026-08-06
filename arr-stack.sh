@@ -113,29 +113,84 @@ check_pve_tools() {
   fi
 }
 
-# A fresh node has never run `pveam update`, so its appliance catalog is empty
-# and the upstream installers die with "No standard_ template found" only after
-# every prompt has been answered. Catch it before the first dialog instead.
-check_template_catalog() {
-  local want="debian-13-standard"
+# Make sure one template is downloaded to the template storage. Upstream
+# searches the storage, not the catalog, so a fresh catalog is not enough.
+ensure_template() {
+  local tmpl=$1 file
 
-  if pveam available --section system 2>/dev/null | grep -q "$want"; then
+  if pveam list "$var_template_storage" 2>/dev/null | grep -q "${tmpl}_"; then
     return 0
   fi
 
-  msg_info "LXC template catalog is empty or stale — refreshing..."
-  if ! silent pveam update; then
-    msg_error "pveam update failed. See ${SILENT_LOGFILE} for details."
+  file=$(pveam available --section system 2>/dev/null \
+    | awk -v t="${tmpl}_" '$2 ~ t {print $2; exit}')
+
+  # An untouched node has never run `pveam update`, so its catalog is empty.
+  if [[ -z "$file" ]]; then
+    msg_info "Refreshing the LXC template catalog..."
+    silent pveam update || true
+    file=$(pveam available --section system 2>/dev/null \
+      | awk -v t="${tmpl}_" '$2 ~ t {print $2; exit}')
+  fi
+
+  if [[ -z "$file" ]]; then
+    msg_error "This node's catalog offers no ${tmpl} template."
+    msg_error "Check: pveam available --section system | grep ${tmpl%%-*}"
     exit 1
   fi
 
-  if ! pveam available --section system 2>/dev/null | grep -q "$want"; then
-    msg_error "No ${want} template is available on this node."
-    msg_error "Check 'pveam available --section system' and this node's network access."
+  msg_info "Downloading ${file} (this can take a few minutes)..."
+  if ! silent pveam download "$var_template_storage" "$file"; then
+    msg_error "Failed to download ${file}. See ${SILENT_LOGFILE} for details."
     exit 1
   fi
+  msg_ok "Template ${file} ready."
+}
 
-  msg_ok "LXC template catalog is current."
+# The apps do not all share an OS -- Jellyfin is Ubuntu-based while the *arrs
+# are Debian -- and each upstream ct/*.sh declares what it needs via var_os and
+# var_version. Read those, then make sure every template is actually on disk
+# before a single container is created.
+prepare_templates() {
+  local s script_file os ver tmpl
+  local -a needed=()
+  declare -A seen=()
+
+  msg_info "Checking LXC templates for the selected apps..."
+
+  for s in "${ORDERED_SLUGS[@]}"; do
+    script_file="$TEMP_DIR/${s}.sh"
+    if [[ ! -s "$script_file" ]]; then
+      silent curl -fsSL \
+        "https://raw.githubusercontent.com/community-scripts/${var_repo}/main/ct/${s}.sh" \
+        -o "$script_file" || true
+    fi
+    if [[ ! -s "$script_file" ]]; then
+      msg_error "Could not download ct/${s}.sh"
+      exit 1
+    fi
+
+    os=$(awk -F'"' '/^var_os=/ {print $2; exit}' "$script_file")
+    ver=$(awk -F'"' '/^var_version=/ {print $2; exit}' "$script_file")
+
+    if [[ -z "$os" || -z "$ver" ]]; then
+      msg_warn "Could not read the OS that ct/${s}.sh needs; skipping its template check."
+      continue
+    fi
+
+    tmpl="${os}-${ver}-standard"
+    if [[ -z "${seen[$tmpl]:-}" ]]; then
+      seen[$tmpl]=1
+      needed+=("$tmpl")
+    fi
+  done
+
+  local t
+  for t in "${needed[@]}"; do
+    ensure_template "$t"
+  done
+
+  msg_ok "Templates ready: ${needed[*]:-none required}"
 }
 
 wait_for_port() {
@@ -1425,7 +1480,6 @@ main() {
   header_info
   check_root
   check_pve_tools
-  check_template_catalog
   ensure_dependencies curl whiptail jq iputils-ping
   seed_catalog
   pick_storage
@@ -1439,6 +1493,7 @@ main() {
   pick_ip_mode_and_ips
   pick_ctids
   confirm_summary
+  prepare_templates
   install_loop
   wait_and_extract_keys
   wire_apis
