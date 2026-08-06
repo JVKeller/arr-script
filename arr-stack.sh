@@ -147,6 +147,19 @@ ensure_template() {
   msg_ok "Template ${file} ready."
 }
 
+# Upstream writes these as var_os="${var_os:-debian}" so the value has to be
+# pulled out of the parameter-expansion default. Plain var_os="debian" also works.
+read_ct_var() {
+  local file=$1 name=$2 raw
+  raw=$(sed -n "s/^${name}=//p" "$file" | head -n1)
+  raw="${raw%\"}"
+  raw="${raw#\"}"
+  if [[ "$raw" =~ ^\$\{[A-Za-z_][A-Za-z0-9_]*:-(.+)\}$ ]]; then
+    raw="${BASH_REMATCH[1]}"
+  fi
+  printf '%s' "$raw"
+}
+
 # The apps do not all share an OS -- Jellyfin is Ubuntu-based while the *arrs
 # are Debian -- and each upstream ct/*.sh declares what it needs via var_os and
 # var_version. Read those, then make sure every template is actually on disk
@@ -170,8 +183,15 @@ prepare_templates() {
       exit 1
     fi
 
-    os=$(awk -F'"' '/^var_os=/ {print $2; exit}' "$script_file")
-    ver=$(awk -F'"' '/^var_version=/ {print $2; exit}' "$script_file")
+    os=$(read_ct_var "$script_file" var_os)
+    ver=$(read_ct_var "$script_file" var_version)
+
+    # A leftover $ means the line was some other shape we do not understand;
+    # a bad template name would fail later and much less clearly.
+    if [[ "$os" == *'$'* || "$ver" == *'$'* ]]; then
+      msg_warn "Could not parse the OS in ct/${s}.sh (got '${os}-${ver}'); skipping its template check."
+      continue
+    fi
 
     if [[ -z "$os" || -z "$ver" ]]; then
       msg_warn "Could not read the OS that ct/${s}.sh needs; skipping its template check."
