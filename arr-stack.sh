@@ -99,13 +99,38 @@ check_root() {
 
 check_pve_tools() {
   local missing=()
-  for cmd in pct pvesh pvesm; do
+  for cmd in pct pvesh pvesm pveam; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   if (( ${#missing[@]} > 0 )); then
     msg_error "Missing Proxmox VE tools: ${missing[*]}. Run this on a PVE node."
     exit 1
   fi
+}
+
+# A fresh node has never run `pveam update`, so its appliance catalog is empty
+# and the upstream installers die with "No standard_ template found" only after
+# every prompt has been answered. Catch it before the first dialog instead.
+check_template_catalog() {
+  local want="debian-13-standard"
+
+  if pveam available --section system 2>/dev/null | grep -q "$want"; then
+    return 0
+  fi
+
+  msg_info "LXC template catalog is empty or stale — refreshing..."
+  if ! silent pveam update; then
+    msg_error "pveam update failed. See ${SILENT_LOGFILE} for details."
+    exit 1
+  fi
+
+  if ! pveam available --section system 2>/dev/null | grep -q "$want"; then
+    msg_error "No ${want} template is available on this node."
+    msg_error "Check 'pveam available --section system' and this node's network access."
+    exit 1
+  fi
+
+  msg_ok "LXC template catalog is current."
 }
 
 wait_for_port() {
@@ -1340,6 +1365,7 @@ main() {
   header_info
   check_root
   check_pve_tools
+  check_template_catalog
   ensure_dependencies curl whiptail jq iputils-ping
   seed_catalog
   pick_storage
