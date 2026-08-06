@@ -243,36 +243,48 @@ pick_network_defaults() {
       "${options[@]}" 3>&1 1>&2 2>&3) || cancelled "bridge pick"
   fi
 
-  local default_gw
+  # Prefill from this node's own default route so the field usually arrives
+  # already correct and the user just presses OK.
+  local default_gw default_mask="" dev
   default_gw=$(ip -4 route show default | awk '{print $3}' | head -n1)
+  dev=$(ip -4 route show default | awk '{print $5}' | head -n1)
+  if [[ -n "$dev" ]]; then
+    default_mask=$(ip -4 -o addr show dev "$dev" 2>/dev/null \
+      | awk '{print $4}' | head -n1 | cut -d/ -f2)
+  fi
+  [[ "$default_mask" =~ ^[0-9]+$ ]] || default_mask=24
 
-  while [[ -z "$var_gateway" ]] || ! is_valid_ipv4 "$var_gateway"; do
-    var_gateway=$(whiptail --backtitle "$BACKTITLE" \
-      --title "Gateway" \
-      --inputbox "IPv4 gateway for the container subnet (leave blank for default: $default_gw):" 10 70 \
-      "${var_gateway:-$default_gw}" 3>&1 1>&2 2>&3) || cancelled "gateway prompt"
+  # Fully specified by env: nothing to ask.
+  if is_valid_ipv4 "$var_gateway" \
+    && [[ "$var_cidr" =~ ^[0-9]+$ ]] && (( var_cidr >= 1 && var_cidr <= 32 )); then
+    msg_info "Bridge ${var_bridge} | gateway ${var_gateway} | mask /${var_cidr}"
+    return 0
+  fi
 
-    if [[ -z "$var_gateway" && -n "$default_gw" ]]; then
-      var_gateway="$default_gw"
-    fi
-
-    if ! is_valid_ipv4 "$var_gateway"; then
-      whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-        --msgbox "Not a valid IPv4 address: ${var_gateway}" 8 60
-      var_gateway=""
-    fi
-  done
-
+  local answer="${var_gateway:-$default_gw}/${var_cidr:-$default_mask}"
   while true; do
-    var_cidr=$(whiptail --backtitle "$BACKTITLE" \
-      --title "CIDR Mask" \
-      --inputbox "Network mask (1-32, e.g. 24):" 10 60 \
-      "${var_cidr:-24}" 3>&1 1>&2 2>&3) || cancelled "CIDR prompt"
-    if [[ "$var_cidr" =~ ^[0-9]+$ ]] && (( var_cidr >= 1 && var_cidr <= 32 )); then
-      break
+    answer=$(whiptail --backtitle "$BACKTITLE" \
+      --title "Gateway and Subnet" \
+      --inputbox "IPv4 gateway and mask for the containers, e.g. 10.0.0.1/24:" 10 70 \
+      "$answer" 3>&1 1>&2 2>&3) || cancelled "gateway prompt"
+
+    local gw="${answer%%/*}" mask="${answer##*/}"
+
+    if [[ "$answer" != */* ]] || ! is_valid_ipv4 "$gw"; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+        --msgbox "Enter an address and mask together, like 10.0.0.1/24.\n\nNot valid: ${answer}" 10 64
+      continue
     fi
-    whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-      --msgbox "CIDR must be an integer between 1 and 32." 8 60
+
+    if ! [[ "$mask" =~ ^[0-9]+$ ]] || (( mask < 1 || mask > 32 )); then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+        --msgbox "Mask must be an integer between 1 and 32.\n\nGot: /${mask}" 10 64
+      continue
+    fi
+
+    var_gateway="$gw"
+    var_cidr="$mask"
+    break
   done
 
   msg_info "Bridge ${var_bridge} | gateway ${var_gateway} | mask /${var_cidr}"
@@ -663,33 +675,76 @@ _collect_ips_one_by_one() {
   return 0
 }
 
-pick_start_ctid() {
-  local default_start
+pick_ctids() {
+  local default_start id s
   if [[ -n "$var_start_ctid" ]]; then
     default_start="$var_start_ctid"
   else
     default_start=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
   fi
+  [[ "$default_start" =~ ^[0-9]+$ ]] || default_start=100
 
-  local start
-  start=$(whiptail --backtitle "$BACKTITLE" \
-    --title "Starting CTID" \
-    --inputbox "Starting Container ID (in-use IDs are skipped):" 10 60 \
-    "$default_start" 3>&1 1>&2 2>&3) || cancelled "starting CTID prompt"
-
-  if ! [[ "$start" =~ ^[0-9]+$ ]]; then
-    msg_error "Invalid CTID: $start"
-    exit 1
-  fi
-
-  local id=$start s
+  # Sequential IDs, skipping ones already taken. These only prefill the prompt;
+  # the user is free to replace any of them with non-sequential values.
+  local -a defaults=()
+  id=$default_start
   for s in "${ORDERED_SLUGS[@]}"; do
     while pct status "$id" >/dev/null 2>&1; do
       id=$((id + 1))
       (( id > 999999 )) && { msg_error "Ran out of CTID space."; exit 1; }
     done
-    APP[$s.ctid]=$id
+    defaults+=("$id")
     id=$((id + 1))
+  done
+
+  local expected_n=${#ORDERED_SLUGS[@]}
+  local hint=""
+  for s in "${ORDERED_SLUGS[@]}"; do hint+="  ${s}"; done
+
+  local answer="${defaults[*]}"
+  while true; do
+    answer=$(whiptail --backtitle "$BACKTITLE" \
+      --title "Container IDs" \
+      --inputbox "Assign a CTID to each container, in this order:"$'\n\n'"${hint}" \
+      14 78 "$answer" 3>&1 1>&2 2>&3) || cancelled "CTID entry"
+
+    local -a ids=()
+    # shellcheck disable=SC2206
+    ids=( ${answer//,/ } )
+
+    if (( ${#ids[@]} != expected_n )); then
+      whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
+        --msgbox "Expected ${expected_n} IDs, got ${#ids[@]}. Please re-enter." 8 60
+      continue
+    fi
+
+    local ok=1 i
+    for i in "${!ids[@]}"; do
+      if ! [[ "${ids[$i]}" =~ ^[0-9]+$ ]] || (( ids[i] < 100 )); then
+        whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+          --msgbox "Entry $((i+1)) must be a number >= 100: ${ids[$i]}" 8 64
+        ok=0; break
+      fi
+      if pct status "${ids[$i]}" >/dev/null 2>&1; then
+        whiptail --backtitle "$BACKTITLE" --title "CTID In Use" \
+          --msgbox "CTID ${ids[$i]} is already in use on this node." 8 60
+        ok=0; break
+      fi
+    done
+    (( ok == 0 )) && continue
+
+    local dup
+    dup=$(printf '%s\n' "${ids[@]}" | sort | uniq -d | head -n1)
+    if [[ -n "$dup" ]]; then
+      whiptail --backtitle "$BACKTITLE" --title "Duplicate CTID" \
+        --msgbox "CTID appears more than once: ${dup}" 8 60
+      continue
+    fi
+
+    for i in "${!ORDERED_SLUGS[@]}"; do
+      APP[${ORDERED_SLUGS[$i]}.ctid]=${ids[$i]}
+    done
+    return 0
   done
 }
 
@@ -1382,7 +1437,7 @@ main() {
   pick_example_indexer
   compute_ordered_slugs
   pick_ip_mode_and_ips
-  pick_start_ctid
+  pick_ctids
   confirm_summary
   install_loop
   wait_and_extract_keys
