@@ -42,6 +42,11 @@ BACKTITLE="Proxmox VE Helper Scripts — arr Stack"
 TEMP_DIR=$(mktemp -d)
 _on_exit() {
   local rc=$?
+  # install_loop's progress gauge owns the whole screen and is only closed on
+  # the success path. Tear it down first, or every failure message below gets
+  # painted over and the run looks like a silent death.
+  exec 4>&- 2>/dev/null || true
+  sleep 0.2
   if (( rc != 0 )); then
     if (( ${#INSTALLED_SLUGS[@]} > 0 )); then orphan_report; fi
     if [[ -s "$SILENT_LOGFILE" ]]; then
