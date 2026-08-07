@@ -1152,31 +1152,46 @@ add_example_indexer_to_prowlarr() {
 
   local prowlarr_ip="${APP[prowlarr.ip]}"
   local prowlarr_key="${APP[prowlarr.apikey]:-}"
+  local label="Prowlarr example indexer (1337x, DISABLED)"
   if [[ -z "$prowlarr_key" ]]; then
-    record_failure "Example indexer (1337x)  FAIL (no prowlarr apikey)"
+    record_failure "${label}  FAIL (no prowlarr apikey)"
     return 1
   fi
 
+  # Ask Prowlarr for the definition's own schema rather than hand-writing the
+  # payload. Definitions migrate between native and Cardigann implementations
+  # upstream, and a stale implementation/configContract pair is just a 400.
+  local schema
+  schema=$(curl -fsS --max-time 30 -H "X-Api-Key: $prowlarr_key" \
+    "http://${prowlarr_ip}:9696/api/v1/indexer/schema" 2>/dev/null) || {
+    record_failure "${label}  FAIL (could not read indexer schema)"
+    msg_warn "${label} failed (could not read indexer schema)"
+    return 1
+  }
+
+  # A fresh Prowlarr ships exactly one app profile ("Standard"), but read it
+  # rather than assuming the id.
+  local profile_id
+  profile_id=$(curl -fsS --max-time 30 -H "X-Api-Key: $prowlarr_key" \
+    "http://${prowlarr_ip}:9696/api/v1/appprofile" 2>/dev/null \
+    | jq -r '.[0].id // 1')
+  [[ "$profile_id" =~ ^[0-9]+$ ]] || profile_id=1
+
   local payload
-  payload=$(jq -n \
-    --arg name "1337x" \
-    --arg baseUrl "https://1337x.to" \
-    '{
-      enable: false,
-      priority: 50,
-      name: $name,
-      implementation: "Torrent1337x",
-      implementationName: "1337x",
-      configContract: "Torrent1337xSettings",
-      tags: [],
-      fields: [
-        { name: "baseUrl", value: $baseUrl }
-      ]
-    }')
+  payload=$(jq -n --argjson schema "$schema" --argjson profile "$profile_id" '
+    ($schema | map(select(.definitionName == "1337x")) | first) as $s
+    | if $s == null then empty
+      else $s + { enable: false, appProfileId: $profile, tags: [] }
+      end')
+
+  if [[ -z "$payload" ]]; then
+    record_failure "${label}  FAIL (1337x not offered by this Prowlarr)"
+    msg_warn "${label} failed (1337x not in this Prowlarr's definitions)"
+    return 1
+  fi
 
   api_post "http://${prowlarr_ip}:9696/api/v1/indexer?forceSave=true" \
-    "$prowlarr_key" "$payload" \
-    "Prowlarr example indexer (1337x, DISABLED)" || true
+    "$prowlarr_key" "$payload" "$label" || true
 }
 
 wire_arrs_into_prowlarr() {
