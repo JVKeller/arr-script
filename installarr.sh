@@ -14,7 +14,7 @@ formatting
 icons
 set_std_mode
 
-SILENT_LOGFILE="/tmp/arr-stack-$$.log"
+SILENT_LOGFILE="/tmp/installarr-$$.log"
 silent() { "$@" >>"$SILENT_LOGFILE" 2>&1; }
 
 msg_info()  { echo -e "${INFO:-[i]} ${YW}${1}${CL}"; }
@@ -33,11 +33,11 @@ var_cidr="${var_cidr:-24}"
 var_start_ctid="${var_start_ctid:-}"
 var_repo="${var_repo:-ProxmoxVE}"
 var_qbt_password="${var_qbt_password:-}"
-SUMMARY_FILE="${SUMMARY_FILE:-/root/arr-stack-summary.txt}"
+SUMMARY_FILE="${SUMMARY_FILE:-/root/installarr-summary.txt}"
 
 QBT_PERMANENT=0
 
-BACKTITLE="Proxmox VE Helper Scripts — arr Stack"
+BACKTITLE="Proxmox VE Helper Scripts — Installarr"
 
 TEMP_DIR=$(mktemp -d)
 _on_exit() {
@@ -86,11 +86,10 @@ SYNC_CATEGORIES_LIDARR='[3000,3010,3020,3030,3040]'
 header_info() {
   clear
   cat <<"EOF"
-                              _             _
-   __ _ _ __ _ __         ___| |_ __ _  ___| | __
-  / _` | '__| '__| ____  / __| __/ _` |/ __| |/ /
- | (_| | |  | |   |____| \__ \ || (_| | (__|   <
-  \__,_|_|  |_|          |___/\__\__,_|\___|_|\_\
+
+    █      █▀▀  █▄▄  ▀▀█          ▀▀█ 
+    █ ▓▀▀█ ▀▀▀█ █   █▀▀▓ ▓   ▓   █▀▀▓ ▓▀▀█ ▓▀▀█  
+    █ █  ▓ █▄▄▓ █▄▄ ▓▄▄▓ █▄▄ █▄▄ ▓▄▄▓ ▓    ▓
 
 EOF
 }
@@ -1533,7 +1532,7 @@ main() {
   wait_and_extract_keys
   wire_apis
   write_summary
-  msg_ok "arr-stack provisioning finished."
+  msg_ok "Installarr provisioning finished."
 }
 
 main "$@"
