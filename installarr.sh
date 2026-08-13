@@ -428,7 +428,9 @@ _gen_password() {
 }
 
 pick_qbittorrent_password() {
-  [[ " $SELECTED_CLIENTS " == *" qbittorrent "* ]] || return
+  # `return` with no argument inherits the failed test's status, which under
+  # `set -e` kills the whole run when qBittorrent is deselected. Be explicit.
+  [[ " $SELECTED_CLIENTS " == *" qbittorrent "* ]] || return 0
   [[ -n "$var_qbt_password" ]] && { msg_info "qBittorrent password (from env) will be used."; return; }
 
   local choice
