@@ -34,6 +34,8 @@ var_start_ctid="${var_start_ctid:-}"
 var_repo="${var_repo:-ProxmoxVE}"
 var_qbt_password="${var_qbt_password:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-/root/installarr-summary.txt}"
+# Read by upstream set_std_mode(): "yes" leaves STD empty so output streams.
+VERBOSE="${VERBOSE:-no}"
 
 QBT_PERMANENT=0
 
@@ -127,7 +129,7 @@ ensure_template() {
   # An untouched node has never run `pveam update`, so its catalog is empty.
   if [[ -z "$file" ]]; then
     msg_info "Refreshing the LXC template catalog..."
-    silent pveam update || true
+    $STD pveam update || true
     file=$(pveam available --section system 2>/dev/null \
       | awk -v t="${tmpl}_" '$2 ~ t {print $2; exit}')
   fi
@@ -139,8 +141,11 @@ ensure_template() {
   fi
 
   msg_info "Downloading ${file} (this can take a few minutes)..."
-  if ! silent pveam download "$var_template_storage" "$file"; then
-    msg_error "Failed to download ${file}. See ${SILENT_LOGFILE} for details."
+  if ! $STD pveam download "$var_template_storage" "$file"; then
+    # Verbose mode streams to the terminal instead, leaving the log empty.
+    local hint=""
+    if [[ "$VERBOSE" != "yes" ]]; then hint=" See ${SILENT_LOGFILE} for details."; fi
+    msg_error "Failed to download ${file}.${hint}"
     exit 1
   fi
   msg_ok "Template ${file} ready."
@@ -173,7 +178,7 @@ prepare_templates() {
   for s in "${ORDERED_SLUGS[@]}"; do
     script_file="$TEMP_DIR/${s}.sh"
     if [[ ! -s "$script_file" ]]; then
-      silent curl -fsSL \
+      $STD curl -fsSL \
         "https://raw.githubusercontent.com/community-scripts/${var_repo}/main/ct/${s}.sh" \
         -o "$script_file" || true
     fi
@@ -400,6 +405,18 @@ pick_clients() {
     3>&1 1>&2 2>&3) || cancelled "download client pick"
 
   SELECTED_CLIENTS=$(echo "$choice" | tr -d '"')
+}
+
+pick_verbose() {
+  if whiptail --backtitle "$BACKTITLE" \
+    --title "Verbose Mode" \
+    --defaultno \
+    --yesno "Show full installation output?\n\nNo  - progress bar only (details in ${SILENT_LOGFILE})\nYes - stream every command as it runs" 12 70; then
+    VERBOSE="yes"
+  else
+    VERBOSE="no"
+  fi
+  set_std_mode
 }
 
 pick_jellyfin() {
@@ -846,18 +863,30 @@ orphan_report() {
   done
 }
 
+# The gauge is fullscreen, so it would paint over streamed output. In verbose
+# mode it is never opened and there is no fd 4 to write to.
+progress() {
+  local pct=$1 text=$2
+  if [[ "$VERBOSE" == "yes" ]]; then
+    msg_step "$text"
+  else
+    echo -e "XXX\n${pct}\n${text}\nXXX" >&4
+  fi
+}
+
 install_loop() {
   local total=${#ORDERED_SLUGS[@]} idx=0
   local s script_file ip ctid port
 
   # Upstream's diagnostics_check() opens a whiptail prompt when this file is
-  # absent. The gauge below owns the screen and $STD swallows stderr, so that
-  # prompt paints into the log and blocks on a keypress nobody can see. Seed the
-  # opt-out first; an existing file is left alone.
+  # absent. $STD swallows stderr, so that prompt paints into the log and blocks
+  # on a keypress nobody can see. Seed the opt-out; an existing file is kept.
   mkdir -p /usr/local/community-scripts
   [[ -f /usr/local/community-scripts/diagnostics ]] || echo "DIAGNOSTICS=no" > /usr/local/community-scripts/diagnostics
 
-  exec 4> >(whiptail --backtitle "$BACKTITLE" --title "Installing Containers" --gauge "Starting installation..." 10 70 0)
+  if [[ "$VERBOSE" != "yes" ]]; then
+    exec 4> >(whiptail --backtitle "$BACKTITLE" --title "Installing Containers" --gauge "Starting installation..." 10 70 0)
+  fi
 
   for s in "${ORDERED_SLUGS[@]}"; do
     idx=$((idx + 1))
@@ -870,7 +899,7 @@ install_loop() {
     local half_pct=$(( base_pct + (50 / total) ))
     local full_pct=$(( idx * 100 / total ))
 
-    echo -e "XXX\n${base_pct}\n[${idx}/${total}] Downloading ct/${s}.sh...\nXXX" >&4
+    progress "$base_pct" "[${idx}/${total}] Downloading ct/${s}.sh..."
 
     $STD curl -fsSL \
       "https://raw.githubusercontent.com/community-scripts/${var_repo}/main/ct/${s}.sh" \
@@ -882,12 +911,13 @@ install_loop() {
       exit 1
     fi
 
-    echo -e "XXX\n${half_pct}\n[${idx}/${total}] Installing ${s} -> ctid=${ctid} ip=${ip}/${var_cidr}\nXXX" >&4
+    progress "$half_pct" "[${idx}/${total}] Installing ${s} -> ctid=${ctid} ip=${ip}/${var_cidr}"
 
     # stdin from /dev/null: any prompt upstream adds in future fails fast and
     # visibly instead of hanging forever behind the gauge.
     $STD env \
       MODE=generated mode=generated PHS_SILENT=1 \
+      VERBOSE="$VERBOSE" var_verbose="$VERBOSE" \
       var_ctid="$ctid" \
       var_hostname="$s" \
       var_brg="$var_bridge" \
@@ -900,14 +930,14 @@ install_loop() {
     INSTALLED_SLUGS+=("$s")
 
     if [[ "${APP[$s.kind]}" == "arr" || "${APP[$s.kind]}" == "indexer" ]]; then
-      echo -e "XXX\n${half_pct}\n[${idx}/${total}] Waiting for ${s} to listen on ${port}...\nXXX" >&4
+      progress "$half_pct" "[${idx}/${total}] Waiting for ${s} to listen on ${port}..."
       if ! wait_for_port "$ip" "$port" 90; then
         # Handled silently; warning is re-issued during extraction
         :
       fi
     fi
 
-    echo -e "XXX\n${full_pct}\n[${idx}/${total}] Installed ${s}\nXXX" >&4
+    progress "$full_pct" "[${idx}/${total}] Installed ${s}"
   done
 
   exec 4>&-
@@ -1537,6 +1567,7 @@ main() {
   compute_ordered_slugs
   pick_ip_mode_and_ips
   pick_ctids
+  pick_verbose
   confirm_summary
   prepare_templates
   install_loop
