@@ -96,6 +96,15 @@ header_info() {
 EOF
 }
 
+welcome() {
+  whiptail --backtitle "$BACKTITLE" \
+    --title "Welcome to Installarr" \
+    --msgbox "This will automate much of the build process for your personal Arr Stack as separate LXC containers and wires them together for you.\n\n\
+You will be asked a handful of questions first, then it runs unattended.\n\n\
+WARNING: This could take a long time depending on how many apps you pick and your download speed. Do not close this session." \
+    17 72 || cancelled "welcome screen"
+}
+
 check_root() {
   if [[ $EUID -ne 0 ]]; then
     msg_error "Run this script as root."
@@ -1556,6 +1565,7 @@ main() {
   check_root
   check_pve_tools
   ensure_dependencies curl whiptail jq iputils-ping
+  welcome
   seed_catalog
   pick_storage
   pick_network_defaults
