@@ -1218,8 +1218,8 @@ add_example_indexer_to_prowlarr() {
   [[ "$profile_id" =~ ^[0-9]+$ ]] || profile_id=1
 
   local payload
-  payload=$(jq -n --argjson schema "$schema" --argjson profile "$profile_id" '
-    ($schema | map(select(.definitionName == "1337x")) | first) as $s
+  payload=$(printf '%s' "$schema" | jq -c --argjson profile "$profile_id" '
+    (map(select(.definitionName == "1337x")) | first) as $s
     | if $s == null then empty
       else $s + { enable: false, appProfileId: $profile, tags: [] }
       end')
@@ -1418,7 +1418,7 @@ wire_bazarr_into_arrs() {
 wire_apis() {
   msg_step "Wiring apps together via HTTP APIs"
   probe_lidarr_api_version
-  add_example_indexer_to_prowlarr
+  add_example_indexer_to_prowlarr || true
   wire_arrs_into_prowlarr
   wire_clients_into_arrs
   wire_bazarr_into_arrs
