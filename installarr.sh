@@ -850,6 +850,13 @@ install_loop() {
   local total=${#ORDERED_SLUGS[@]} idx=0
   local s script_file ip ctid port
 
+  # Upstream's diagnostics_check() opens a whiptail prompt when this file is
+  # absent. The gauge below owns the screen and $STD swallows stderr, so that
+  # prompt paints into the log and blocks on a keypress nobody can see. Seed the
+  # opt-out first; an existing file is left alone.
+  mkdir -p /usr/local/community-scripts
+  [[ -f /usr/local/community-scripts/diagnostics ]] || echo "DIAGNOSTICS=no" > /usr/local/community-scripts/diagnostics
+
   exec 4> >(whiptail --backtitle "$BACKTITLE" --title "Installing Containers" --gauge "Starting installation..." 10 70 0)
 
   for s in "${ORDERED_SLUGS[@]}"; do
@@ -877,6 +884,8 @@ install_loop() {
 
     echo -e "XXX\n${half_pct}\n[${idx}/${total}] Installing ${s} -> ctid=${ctid} ip=${ip}/${var_cidr}\nXXX" >&4
 
+    # stdin from /dev/null: any prompt upstream adds in future fails fast and
+    # visibly instead of hanging forever behind the gauge.
     $STD env \
       MODE=generated mode=generated PHS_SILENT=1 \
       var_ctid="$ctid" \
@@ -886,7 +895,7 @@ install_loop() {
       var_gateway="$var_gateway" \
       var_container_storage="$var_container_storage" \
       var_template_storage="$var_template_storage" \
-      bash "$script_file"
+      bash "$script_file" </dev/null
 
     INSTALLED_SLUGS+=("$s")
 
