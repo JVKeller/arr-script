@@ -85,18 +85,38 @@ SYNC_CATEGORIES_SONARR='[5000,5010,5020,5030,5040,5045,5050]'
 SYNC_CATEGORIES_RADARR='[2000,2010,2020,2030,2040,2045,2050,2060]'
 SYNC_CATEGORIES_LIDARR='[3000,3010,3020,3030,3040]'
 
+# The banner already shades with █ vs ▓, so those get bright and dim green to
+# make the depth read as deliberate. Revealed a line at a time.
 header_info() {
   clear
-  cat <<"EOF"
+  local -a lines=(
+"    █      █▀▀  █▄▄  ▀▀█          ▀▀█ "
+"    █ ▓▀▀█ ▀▀▀█ █   █▀▀▓ ▓   ▓   █▀▀▓ ▓▀▀█ ▓▀▀█  "
+"    █ █  ▓ █▄▄▓ █▄▄ ▓▄▄▓ █▄▄ █▄▄ ▓▄▄▓ ▓    ▓"
+  )
 
-    █      █▀▀  █▄▄  ▀▀█          ▀▀█ 
-    █ ▓▀▀█ ▀▀▀█ █   █▀▀▓ ▓   ▓   █▀▀▓ ▓▀▀█ ▓▀▀█  
-    █ █  ▓ █▄▄▓ █▄▄ ▓▄▄▓ █▄▄ █▄▄ ▓▄▄▓ ▓    ▓
-
-EOF
+  echo
+  local l
+  for l in "${lines[@]}"; do
+    if [[ -t 1 ]]; then
+      printf '%b%s%b\n' "$GN" "$(sed "s/▓/${DGN}▓${GN}/g" <<<"$l")" "$CL"
+      sleep 0.15
+    else
+      printf '%s\n' "$l"
+    fi
+  done
+  echo
 }
 
+# Runs before ensure_dependencies, so whiptail is not guaranteed to be present
+# yet -- fall back to plain text rather than dying before we can install it.
 welcome() {
+  if ! command -v whiptail >/dev/null 2>&1; then
+    msg_info "Installarr builds your Arr Stack as separate LXC containers and wires them together."
+    msg_warn "This could take a long time. Do not close this session."
+    return 0
+  fi
+
   whiptail --backtitle "$BACKTITLE" \
     --title "Welcome to Installarr" \
     --msgbox "This will automate much of the build process for your personal Arr Stack as separate LXC containers and wires them together for you.\n\n\
@@ -1562,10 +1582,13 @@ write_summary() {
 
 main() {
   header_info
+  # Let the banner actually be seen -- the welcome dialog paints over it.
+  # header_info already spends ~0.5s revealing itself.
+  sleep 2
+  welcome
   check_root
   check_pve_tools
   ensure_dependencies curl whiptail jq iputils-ping
-  welcome
   seed_catalog
   pick_storage
   pick_network_defaults
