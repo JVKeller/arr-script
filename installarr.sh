@@ -48,7 +48,7 @@ _on_exit() {
   # the success path. Tear it down first, or every failure message below gets
   # painted over and the run looks like a silent death.
   exec 4>&- 2>/dev/null || true
-  sleep 0.2
+  sleep 0.5
   if (( rc != 0 )); then
     if (( ${#INSTALLED_SLUGS[@]} > 0 )); then orphan_report; fi
     if [[ -s "$SILENT_LOGFILE" ]]; then
@@ -95,11 +95,19 @@ header_info() {
 "    █ █  ▓ █▄▄▓ █▄▄ ▓▄▄▓ █▄▄ █▄▄ ▓▄▄▓ ▓    ▓"
   )
 
+  # core.func stores its colors as the literal text \033[..m, which only renders
+  # via `echo -e`/%b. Embedding those in a sed replacement loses the backslash,
+  # so build real escape bytes here instead.
+  local bright dim reset
+  bright=$(printf '\033[1;92m')
+  dim=$(printf '\033[32m')
+  reset=$(printf '\033[m')
+
   echo
   local l
   for l in "${lines[@]}"; do
     if [[ -t 1 ]]; then
-      printf '%b%s%b\n' "$GN" "$(sed "s/▓/${DGN}▓${GN}/g" <<<"$l")" "$CL"
+      printf '%s%s%s\n' "$bright" "${l//▓/${dim}▓${bright}}" "$reset"
       sleep 0.15
     else
       printf '%s\n' "$l"
