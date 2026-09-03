@@ -61,6 +61,87 @@ payloads need a separate address, `APP[$s.wireip]`.
 
 ---
 
+---
+
+## Verified against CT 999 (2026-09-03)
+
+Live configuration was dumped from the reference build (gluetun CT 999, clients
+215/219, control case 210). **Where this section and the prose below disagree,
+this section wins.**
+
+Egress proves the topology: 219 and 215 both exit `143.244.42.75` (Surfshark
+Netherlands), 210 exits `98.17.49.225` (the ISP). The role split works.
+
+### Confirmed exactly as designed
+
+- The three FORWARD rules, verbatim, including `-A FORWARD -i eth1 ! -o wg0 -j DROP`.
+- `-t nat -A POSTROUTING -o wg0 -j MASQUERADE`.
+- The MSS clamp, in mangle. `wg0` MTU really is 1320 against eth0 1500.
+- `/etc/sysctl.d/99-gluetun-gw.conf` containing only `net.ipv4.ip_forward=1`.
+- `mgmt-route.service` — `After=sysinit.target`, `Type=oneshot`,
+  `RemainAfterExit=yes`, `ip route replace`. Character for character.
+- Client `net0` on `vmbr1` **with** `gw=`, `net1` on `vmbr0` **without** `gw=`.
+- Client `nameserver` = the Gluetun VPN address (`10.10.10.1`).
+- The `vmbr1` stanza: `bridge-ports none`, `bridge-stp off`, `bridge-fd 0`.
+- `WIREGUARD_ADDRESSES=10.14.0.2/16` — a CIDR, as the plan insists.
+- `SERVER_COUNTRIES=Netherlands`, and no `SERVER_HOSTNAMES`.
+- `HTTP_CONTROL_SERVER_ADDRESS=:8000`.
+- Chain growth is real: INPUT/OUTPUT carry 4-5 duplicate rule sets and stale
+  per-server `--dport 51820` ACCEPTs. The `iptables -C` guards are necessary.
+
+### Missing from the plan — add to Commit 2
+
+1. **`/dev/net/tun` passthrough. Without this WireGuard cannot start in an
+   unprivileged LXC — a hard failure, and the plan never mentions it.** CT 999
+   carries:
+   ```
+   lxc.cgroup2.devices.allow: c 10:200 rwm
+   lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+   ```
+   These go in `/etc/pve/lxc/<ctid>.conf`; `pct set` cannot write them.
+2. **`features: nesting=1,keyctl=1`** on the Gluetun container.
+3. **Boot ordering via `startup: up=N`** — 215 is `up=30`, 219 is `up=70`.
+   Without it clients start before the gateway has a tunnel.
+4. **`onboot: 1`** on every VPN member and the gateway.
+5. Gluetun is **not** Docker here. It is `/usr/local/bin/gluetun` under
+   `gluetun.service` with `EnvironmentFile=/opt/gluetun-data/.env` and
+   `AmbientCapabilities=CAP_NET_ADMIN`. `docker` is not installed (rc=127).
+
+### Plan claims the reference build contradicts
+
+- **`firewall=0` on `net1` is not the reason LAN access works.** The plan calls
+  it non-negotiable because "Proxmox's per-NIC firewall defaults to dropping
+  inbound". The clients have **no** `firewall` key on `net1` at all and their
+  web UIs are reachable; the only `firewall=1` in the build is on Gluetun's
+  `net1`. Absent means off. Still write `firewall=0` explicitly for
+  determinism, but the stated rationale is wrong and should not be repeated.
+- **Addressing is spaced, not sequential.** Reality is `.10` (qbittorrent) and
+  `.20` (prowlarr), not `.10, .11, .12`. Either scheme works; pick one
+  deliberately rather than inheriting the plan's by accident.
+
+### Defects in the reference build — do not port these
+
+1. **CT 219's `/etc/sysctl.d/99-rp.conf` sets only
+   `net.ipv4.conf.eth1.rp_filter=2`, omitting the `all` key.** CT 215 has both.
+   Runtime currently reads 2 on 219, but that file will not reproduce it on a
+   rebuild. This is exactly the failure the plan warns about — the kernel takes
+   the max of `all` and the interface, so the interface key alone is not
+   sufficient. **Write both. 215 is the correct model, 219 is not.**
+2. **`/opt/gluetun-data/.env` is mode 644 and holds the WireGuard private key.**
+   The plan's `chmod 600` is a genuine improvement; keep it.
+3. **`TZ=UTC` in the `.env`** while the container timezone is
+   `America/New_York`. The plan's "TZ from `timedatectl`" is correct.
+4. `netfilter-persistent` is what persists rules today, with no ordering
+   relationship to `gluetun.service` — the condition the plan's ordered oneshot
+   replaces. The deviation is justified; the duplicate-rule accumulation above
+   is the evidence.
+5. The control server reports `{"public_ip":""}` and `/gluetun/ip` is 0 bytes,
+   despite a working tunnel. **Do not gate `vpn_verify` on that endpoint alone**
+   — step 2 must compare client `ifconfig.me` results to each other, and treat
+   the control-server IP as advisory.
+
+---
+
 ## Commit 1 — Dedupe the IP collectors (no VPN code)
 
 Strictly behaviour-preserving. Landed first so the VPN diff stays readable.
