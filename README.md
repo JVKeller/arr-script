@@ -2,6 +2,8 @@
 
 A Proxmox VE helper script to automate deployment and configuration of a basic containerized media automation stack focusing on automated API wiring, credential extraction, and simplified operator experience for self-hosted media libraries.
 
+### *** This Arr Stack setup is for testing purposes only for your personal media library. ***
+
 ## What is Included
 
 ### New Development...
