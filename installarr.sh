@@ -564,197 +564,127 @@ pick_ip_mode_and_ips() {
   done
 }
 
+# Validation shared by every IP entry mode. check_live gates the reachability
+# probe: the two form modes ping before accepting, list mode never has.
+_validate_ip_set() {
+  local check_live=$1; shift
+  local -a ips=("$@")
+  local expected_n=${#ORDERED_SLUGS[@]}
+  local i ip dup
+
+  if (( ${#ips[@]} != expected_n )); then
+    whiptail --backtitle "$BACKTITLE" --title "Wrong count"       --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
+    return 1
+  fi
+
+  for i in "${!ips[@]}"; do
+    ip="${ips[$i]}"
+    if ! is_valid_ipv4 "$ip"; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid"         --msgbox "Entry $((i+1)) is not a valid IPv4: ${ip}" 8 60
+      return 1
+    fi
+    if [[ "$ip" == "$var_gateway" ]]; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid"         --msgbox "Entry $((i+1)) collides with the gateway: ${ip}" 8 60
+      return 1
+    fi
+    if (( check_live )) && ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+      whiptail --backtitle "$BACKTITLE" --title "IP In Use"         --msgbox "Entry $((i+1)) is already in use by another device: ${ip}" 8 60
+      return 1
+    fi
+  done
+
+  dup=$(printf '%s
+' "${ips[@]}" | sort | uniq -d | head -n1)
+  if [[ -n "$dup" ]]; then
+    whiptail --backtitle "$BACKTITLE" --title "Duplicate IP"       --msgbox "IP appears more than once: ${dup}" 8 60
+    return 1
+  fi
+
+  return 0
+}
+
+# Runs whichever form UI is available and emits one IP per line. The dialog and
+# whiptail forms differ only in the invocation and its fd plumbing.
+# Returns 1 if the user cancelled, 2 if neither UI supports --form (the caller
+# then falls back to one inputbox per container).
+_run_ip_form() {
+  local ui expected_n=${#ORDERED_SLUGS[@]}
+  local -a form_fields=()
+  local slug
+  ui=$(form_input_program)
+
+  for slug in "${ORDERED_SLUGS[@]}"; do
+    form_fields+=("$slug" "")
+  done
+
+  case "$ui" in
+    dialog)
+      dialog --backtitle "$BACKTITLE"         --title "Container IP Addresses"         --form "Enter an IPv4 address for each container:" 22 78 0         "${form_fields[@]}" 2>&1 >/dev/tty || return 1
+      ;;
+    whiptail)
+      whiptail --backtitle "$BACKTITLE"         --title "Container IP Addresses"         --separate-output         --form "Enter an IPv4 address for each container:" 22 78 "$((expected_n + 4))"         "${form_fields[@]}" 3>&1 1>&2 2>&3 || return 1
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+_assign_ips_in_order() {
+  local -a ips=("$@")
+  local i
+  for i in "${!ORDERED_SLUGS[@]}"; do
+    APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
+  done
+}
+
 _collect_ips_list_mode() {
   local expected_n=${#ORDERED_SLUGS[@]}
   local hint="" s
-  for s in "${ORDERED_SLUGS[@]}"; do hint+="  ${s}"$'\n'; done
+  for s in "${ORDERED_SLUGS[@]}"; do hint+="  ${s}"$'
+'; done
 
   while true; do
     local raw
-    raw=$(whiptail --backtitle "$BACKTITLE" \
-      --title "Enter ${expected_n} IPv4 addresses" \
-      --inputbox "Enter ${expected_n} IPs separated by spaces or commas, in this order:"$'\n\n'"${hint}" \
-      22 78 "" 3>&1 1>&2 2>&3) || cancelled "IP list entry"
+    raw=$(whiptail --backtitle "$BACKTITLE"       --title "Enter ${expected_n} IPv4 addresses"       --inputbox "Enter ${expected_n} IPs separated by spaces or commas, in this order:"$'
+
+'"${hint}"       22 78 "" 3>&1 1>&2 2>&3) || cancelled "IP list entry"
 
     local normalized="${raw//,/ }"
     local -a ips=()
     # shellcheck disable=SC2206
     ips=( $normalized )
 
-    if (( ${#ips[@]} != expected_n )); then
-      whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
-        --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
-      continue
-    fi
+    _validate_ip_set 0 "${ips[@]}" || continue
 
-    local ok=1 i
-    for i in "${!ips[@]}"; do
-      if ! is_valid_ipv4 "${ips[$i]}"; then
-        whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-          --msgbox "Entry $((i+1)) is not a valid IPv4: ${ips[$i]}" 8 60
-        ok=0; break
-      fi
-      if [[ "${ips[$i]}" == "$var_gateway" ]]; then
-        whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-          --msgbox "Entry $((i+1)) collides with the gateway: ${ips[$i]}" 8 60
-        ok=0; break
-      fi
-    done
-    (( ok == 0 )) && continue
-
-    local dup
-    dup=$(printf '%s\n' "${ips[@]}" | sort | uniq -d | head -n1)
-    if [[ -n "$dup" ]]; then
-      whiptail --backtitle "$BACKTITLE" --title "Duplicate IP" \
-        --msgbox "IP appears more than once: ${dup}" 8 60
-      continue
-    fi
-
-    for i in "${!ORDERED_SLUGS[@]}"; do
-      APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
-    done
+    _assign_ips_in_order "${ips[@]}"
     return
   done
 }
 
 _collect_ips_one_by_one() {
-  local ui
-  ui=$(form_input_program)
+  local raw_values rc
+  local -a ips=()
 
-  if [[ "$ui" == "dialog" ]]; then
-    local expected_n=${#ORDERED_SLUGS[@]}
-    local -a form_fields=()
-    local slug
+  while true; do
+    rc=0
+    raw_values=$(_run_ip_form) || rc=$?
 
-    for slug in "${ORDERED_SLUGS[@]}"; do
-      form_fields+=("$slug" "")
-    done
+    # No --form-capable UI: drop to the one-inputbox-per-container loop below.
+    (( rc == 2 )) && break
 
-    while true; do
-      local raw_values
-      if ! raw_values=$(dialog --backtitle "$BACKTITLE" \
-        --title "Container IP Addresses" \
-        --form "Enter an IPv4 address for each container:" 22 78 0 \
-        "${form_fields[@]}" 2>&1 >/dev/tty); then
-        msg_warn "IP form entry cancelled."
-        return 1
-      fi
+    if (( rc != 0 )); then
+      msg_warn "IP form entry cancelled."
+      return 1
+    fi
 
-      local -a ips=()
-      mapfile -t ips <<< "$raw_values"
+    mapfile -t ips <<< "$raw_values"
 
-      if (( ${#ips[@]} != expected_n )); then
-        whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
-          --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
-        continue
-      fi
+    _validate_ip_set 1 "${ips[@]}" || continue
 
-      local ok=1 i
-      for i in "${!ips[@]}"; do
-        local ip="${ips[$i]}"
-        if ! is_valid_ipv4 "$ip"; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) is not a valid IPv4: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if [[ "$ip" == "$var_gateway" ]]; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) collides with the gateway: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-          whiptail --backtitle "$BACKTITLE" --title "IP In Use" \
-            --msgbox "Entry $((i+1)) is already in use by another device: ${ip}" 8 60
-          ok=0
-          break
-        fi
-      done
-      (( ok == 0 )) && continue
-
-      local dup
-      dup=$(printf '%s\n' "${ips[@]}" | sort | uniq -d | head -n1)
-      if [[ -n "$dup" ]]; then
-        whiptail --backtitle "$BACKTITLE" --title "Duplicate IP" \
-          --msgbox "IP appears more than once: ${dup}" 8 60
-        continue
-      fi
-
-      for i in "${!ORDERED_SLUGS[@]}"; do
-        APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
-      done
-      return 0
-    done
-  fi
-
-  if [[ "$ui" == "whiptail" ]]; then
-    local expected_n=${#ORDERED_SLUGS[@]}
-    local -a form_fields=()
-    local slug
-
-    for slug in "${ORDERED_SLUGS[@]}"; do
-      form_fields+=("$slug" "")
-    done
-
-    while true; do
-      local raw_values
-      if ! raw_values=$(whiptail --backtitle "$BACKTITLE" \
-        --title "Container IP Addresses" \
-        --separate-output \
-        --form "Enter an IPv4 address for each container:" 22 78 "$((expected_n + 4))" \
-        "${form_fields[@]}" 3>&1 1>&2 2>&3); then
-        msg_warn "IP form entry cancelled."
-        return 1
-      fi
-
-      local -a ips=()
-      mapfile -t ips <<< "$raw_values"
-
-      if (( ${#ips[@]} != expected_n )); then
-        whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
-          --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
-        continue
-      fi
-
-      local ok=1 i
-      for i in "${!ips[@]}"; do
-        local ip="${ips[$i]}"
-        if ! is_valid_ipv4 "$ip"; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) is not a valid IPv4: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if [[ "$ip" == "$var_gateway" ]]; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) collides with the gateway: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-          whiptail --backtitle "$BACKTITLE" --title "IP In Use" \
-            --msgbox "Entry $((i+1)) is already in use by another device: ${ip}" 8 60
-          ok=0
-          break
-        fi
-      done
-      (( ok == 0 )) && continue
-
-      local dup
-      dup=$(printf '%s\n' "${ips[@]}" | sort | uniq -d | head -n1)
-      if [[ -n "$dup" ]]; then
-        whiptail --backtitle "$BACKTITLE" --title "Duplicate IP" \
-          --msgbox "IP appears more than once: ${dup}" 8 60
-        continue
-      fi
-
-      for i in "${!ORDERED_SLUGS[@]}"; do
-        APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
-      done
-      return 0
-    done
-  fi
+    _assign_ips_in_order "${ips[@]}"
+    return 0
+  done
 
   local slug ip running="" last_ip="" default_ip=""
   for slug in "${ORDERED_SLUGS[@]}"; do
