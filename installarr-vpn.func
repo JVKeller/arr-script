@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# Gluetun VPN gateway support for installarr.sh.
+#
+# Sourced only when the user opts in, so a declined VPN never fetches this file.
+# Depends on installarr.sh for: msg_* helpers, cancelled(), wait_for_port(),
+# BACKTITLE, APP, ORDERED_SLUGS, is_valid_ipv4(), var_bridge, var_gateway,
+# var_cidr, $STD.
+#
+# Every value here was verified against a working hand-built gateway (CT 999)
+# rather than taken from documentation. Where the two disagreed, CT 999 won.
+
+VPN_ENABLED=0
+VPN_SUBNET=""        # network address, e.g. 10.10.10.0
+VPN_MASK=""          # prefix, e.g. 24
+VPN_GW=""            # gateway address, e.g. 10.10.10.1
+VPN_BRIDGE=""        # e.g. vmbr1
+VPN_MGMT_SUBNET=""   # blank = admin shares the container LAN, no route unit
+VPN_TUN_IF=""        # discovered once the tunnel is up: wg0 or tun0
+
+VPN_PROVIDER=""
+VPN_PROTO=""
+VPN_PRIVKEY=""
+VPN_ADDRESSES=""
+VPN_COUNTRIES=""
+
+# Roles that belong behind the tunnel. Jellyfin (media) and Seerr (requests) are
+# consumer-facing -- tunnelling them breaks remote access.
+_vpn_is_member() {
+  case "${APP[$1.kind]:-}" in
+    indexer | arr | client) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_ip_to_int() {
+  local a b c d
+  IFS=. read -r a b c d <<<"$1"
+  echo $(((a << 24) + (b << 16) + (c << 8) + d))
+}
+
+_int_to_ip() {
+  local v=$1
+  echo "$(((v >> 24) & 255)).$(((v >> 16) & 255)).$(((v >> 8) & 255)).$((v & 255))"
+}
+
+# Network address of ip/prefix, as an integer.
+_net_of() {
+  local ip_int mask
+  ip_int=$(_ip_to_int "$1")
+  mask=$((0xFFFFFFFF << (32 - $2) & 0xFFFFFFFF))
+  echo $((ip_int & mask))
+}
+
+vpn_prompt_settings() {
+  whiptail --backtitle "$BACKTITLE" --title "VPN Gateway" \
+    --yesno "Route indexer, *arr and download-client traffic through a Gluetun VPN gateway?\n\nJellyfin and Seerr stay on the LAN so remote access keeps working." 12 74 \
+    || return 0
+
+  VPN_ENABLED=1
+
+  local lan_net answer gw mask
+  lan_net=$(_net_of "$var_gateway" "$var_cidr")
+
+  while true; do
+    answer=$(whiptail --backtitle "$BACKTITLE" --title "VPN Subnet" \
+      --inputbox "Isolated VPN subnet, as gateway/prefix.\n\nThis bridge has no physical uplink, so containers on it can only reach the internet through the tunnel." \
+      14 74 "10.10.10.1/24" 3>&1 1>&2 2>&3) || cancelled "VPN subnet"
+
+    gw="${answer%%/*}"
+    mask="${answer##*/}"
+    if [[ "$answer" != */* ]] || ! is_valid_ipv4 "$gw" || ! [[ "$mask" =~ ^[0-9]+$ ]] || ((mask < 8 || mask > 30)); then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+        --msgbox "Enter an address and prefix, e.g. 10.10.10.1/24" 8 60
+      continue
+    fi
+
+    if [[ "$(_net_of "$gw" "$mask")" == "$lan_net" ]]; then
+      whiptail --backtitle "$BACKTITLE" --title "Subnet Overlap" \
+        --msgbox "That overlaps the container LAN (${var_gateway}/${var_cidr}). Pick a different range." 9 70
+      continue
+    fi
+
+    VPN_GW="$gw"
+    VPN_MASK="$mask"
+    VPN_SUBNET=$(_int_to_ip "$(_net_of "$gw" "$mask")")
+    break
+  done
+
+  VPN_BRIDGE=$(whiptail --backtitle "$BACKTITLE" --title "VPN Bridge" \
+    --inputbox "Name for the uplink-less bridge carrying tunnel traffic:" 10 70 "vmbr1" \
+    3>&1 1>&2 2>&3) || cancelled "VPN bridge"
+
+  while true; do
+    VPN_MGMT_SUBNET=$(whiptail --backtitle "$BACKTITLE" --title "Management Subnet" \
+      --inputbox "If you administer these containers from a DIFFERENT subnet, enter it as network/prefix (for example 192.168.1.0/24).\n\nLeave blank if your workstation is on the same LAN as the containers." \
+      14 74 "" 3>&1 1>&2 2>&3) || cancelled "management subnet"
+
+    [[ -z "$VPN_MGMT_SUBNET" ]] && break
+    if [[ "$VPN_MGMT_SUBNET" == */* ]] && is_valid_ipv4 "${VPN_MGMT_SUBNET%%/*}"; then break; fi
+    whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+      --msgbox "Enter a network and prefix, e.g. 192.168.1.0/24 -- or leave it blank." 8 70
+  done
+
+  _vpn_prompt_credentials
+}
+
+# Skipped wholesale when var_gluetun_env_file points at a readable file.
+_vpn_prompt_credentials() {
+  if [[ -n "${var_gluetun_env_file:-}" ]]; then
+    if [[ -r "$var_gluetun_env_file" ]]; then
+      msg_info "Using Gluetun credentials from ${var_gluetun_env_file}"
+      return 0
+    fi
+    msg_error "var_gluetun_env_file is set but not readable: ${var_gluetun_env_file}"
+    exit 1
+  fi
+
+  VPN_PROVIDER=$(whiptail --backtitle "$BACKTITLE" --title "VPN Provider" \
+    --menu "Which provider?" 16 70 5 \
+    "surfshark" "Surfshark" \
+    "nordvpn" "NordVPN" \
+    "mullvad" "Mullvad" \
+    "protonvpn" "Proton VPN" \
+    "other" "Enter the Gluetun provider name manually" \
+    3>&1 1>&2 2>&3) || cancelled "VPN provider"
+
+  if [[ "$VPN_PROVIDER" == "other" ]]; then
+    VPN_PROVIDER=$(whiptail --backtitle "$BACKTITLE" --title "VPN Provider" \
+      --inputbox "Gluetun VPN_SERVICE_PROVIDER value:" 10 70 "" 3>&1 1>&2 2>&3) \
+      || cancelled "VPN provider"
+  fi
+
+  VPN_PROTO=$(whiptail --backtitle "$BACKTITLE" --title "VPN Type" \
+    --menu "Tunnel protocol:" 12 70 2 \
+    "wireguard" "WireGuard (recommended)" \
+    "openvpn" "OpenVPN" \
+    3>&1 1>&2 2>&3) || cancelled "VPN type"
+
+  VPN_PRIVKEY=$(whiptail --backtitle "$BACKTITLE" --title "WireGuard Private Key" \
+    --passwordbox "Private key from the WireGuard config your provider issued:" 10 74 \
+    3>&1 1>&2 2>&3) || cancelled "WireGuard key"
+
+  # The single most common Gluetun start failure: this must be the CIDR address
+  # from the [Interface] block, not a server hostname.
+  while true; do
+    VPN_ADDRESSES=$(whiptail --backtitle "$BACKTITLE" --title "WireGuard Addresses" \
+      --inputbox "The Address line from your WireGuard config, WITH the prefix.\n\nExample: 10.14.0.2/16\n\nThis must be an IP and prefix. A server hostname here is the most common cause of Gluetun failing to start." \
+      15 74 "" 3>&1 1>&2 2>&3) || cancelled "WireGuard addresses"
+
+    if [[ "$VPN_ADDRESSES" == */* ]] && is_valid_ipv4 "${VPN_ADDRESSES%%/*}"; then break; fi
+    whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+      --msgbox "That is not an address/prefix. Enter something like 10.14.0.2/16 -- not a hostname." 9 70
+  done
+
+  # SERVER_COUNTRIES, not SERVER_HOSTNAMES: hostnames break whenever Gluetun
+  # refreshes its bundled server list.
+  VPN_COUNTRIES=$(whiptail --backtitle "$BACKTITLE" --title "Server Country" \
+    --inputbox "Country to connect through (Gluetun SERVER_COUNTRIES):" 10 70 "Netherlands" \
+    3>&1 1>&2 2>&3) || cancelled "server country"
+}
+
+# Idempotent. The absence of a physical uplink IS the security property, so the
+# stanza deliberately has no bridge-ports and no host address.
+vpn_ensure_bridge() {
+  ((VPN_ENABLED)) || return 0
+
+  if grep -qE "^[[:space:]]*iface ${VPN_BRIDGE}\b" /etc/network/interfaces; then
+    msg_ok "Bridge ${VPN_BRIDGE} already present."
+    return 0
+  fi
+
+  # A pending GUI network change would later overwrite whatever we append here.
+  if [[ -f /etc/network/interfaces.new ]]; then
+    msg_error "/etc/network/interfaces.new exists -- apply or discard the pending network changes in the Proxmox GUI first."
+    exit 1
+  fi
+
+  msg_info "Creating uplink-less bridge ${VPN_BRIDGE}..."
+  {
+    printf '\n'
+    printf 'auto %s\n' "$VPN_BRIDGE"
+    printf 'iface %s inet manual\n' "$VPN_BRIDGE"
+    printf '\tbridge-ports none\n'
+    printf '\tbridge-stp off\n'
+    printf '\tbridge-fd 0\n'
+  } >>/etc/network/interfaces
+
+  # ifup on a single new isolated bridge cannot disturb existing networking,
+  # which a pvesh-driven apply-everything would risk.
+  if ! $STD ifup "$VPN_BRIDGE"; then
+    msg_error "Could not bring up ${VPN_BRIDGE}."
+    exit 1
+  fi
+  msg_ok "Bridge ${VPN_BRIDGE} up."
+}
+
+# APP[$s.ip] must stay the LAN address -- the host has no leg on the VPN bridge,
+# and every host-side call (wait_for_port, extract_arr_key, api_post) uses it.
+# APP[$s.wireip] is the address the apps use to reach each other.
+vpn_assign_addresses() {
+  local s base host=10
+
+  if ((!VPN_ENABLED)); then
+    for s in "${ORDERED_SLUGS[@]}"; do APP[$s.wireip]="${APP[$s.ip]}"; done
+    return 0
+  fi
+
+  base=$(_net_of "$VPN_GW" "$VPN_MASK")
+
+  for s in "${ORDERED_SLUGS[@]}"; do
+    if [[ "$s" == "gluetun" ]]; then
+      APP[$s.vpnip]="$VPN_GW"
+      APP[$s.wireip]="${APP[$s.ip]}"
+      continue
+    fi
+    if _vpn_is_member "$s"; then
+      APP[$s.vpnip]=$(_int_to_ip $((base + host)))
+      APP[$s.wireip]="${APP[$s.vpnip]}"
+      host=$((host + 10))
+    else
+      APP[$s.wireip]="${APP[$s.ip]}"
+    fi
+  done
+}
+
+# Full replacement rather than key-patching: upstream's installer seeds
+# VPN_SERVICE_PROVIDER=custom plus OPENVPN_* keys that must not survive, and a
+# wholesale rewrite is deterministic where patching is not.
+_vpn_write_env() {
+  local ctid=$1 tz tmp
+
+  if [[ -n "${var_gluetun_env_file:-}" ]]; then
+    $STD pct push "$ctid" "$var_gluetun_env_file" /opt/gluetun-data/.env
+    $STD pct exec "$ctid" -- chmod 600 /opt/gluetun-data/.env
+    return 0
+  fi
+
+  tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo UTC)
+
+  # Staged in a host temp file so the private key never appears in a process
+  # argument list inside the container.
+  tmp=$(mktemp)
+  chmod 600 "$tmp"
+  {
+    printf 'VPN_SERVICE_PROVIDER=%s\n' "$VPN_PROVIDER"
+    printf 'VPN_TYPE=%s\n' "$VPN_PROTO"
+    printf 'WIREGUARD_PRIVATE_KEY=%s\n' "$VPN_PRIVKEY"
+    printf 'WIREGUARD_ADDRESSES=%s\n' "$VPN_ADDRESSES"
+    printf 'SERVER_COUNTRIES=%s\n' "$VPN_COUNTRIES"
+    printf 'PUID=0\n'
+    printf 'PGID=0\n'
+    # Pinned to :8000. Never :51820 -- that is the WireGuard port.
+    printf 'HTTP_CONTROL_SERVER_ADDRESS=:8000\n'
+    printf 'HTTPPROXY=off\n'
+    printf 'SHADOWSOCKS=off\n'
+    printf 'FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT=on\n'
+    printf 'HEALTH_SERVER_ADDRESS=127.0.0.1:9999\n'
+    printf 'DNS_UPSTREAM_RESOLVERS=cloudflare\n'
+    printf 'LOG_LEVEL=info\n'
+    printf 'STORAGE_FILEPATH=/gluetun/servers.json\n'
+    printf 'PUBLICIP_FILE=/gluetun/ip\n'
+    printf 'VPN_PORT_FORWARDING_STATUS_FILE=/gluetun/forwarded_port\n'
+    printf 'TZ=%s\n' "$tz"
+  } >"$tmp"
+
+  $STD pct push "$ctid" "$tmp" /opt/gluetun-data/.env
+  # The reference build left this world-readable with the key in it.
+  $STD pct exec "$ctid" -- chmod 600 /opt/gluetun-data/.env
+  rm -f "$tmp"
+}
+
+# OpenVPN yields tun0, WireGuard wg0. A kill-switch rule written against the
+# wrong interface silently does nothing, so this is never hardcoded.
+_vpn_detect_tun_if() {
+  pct exec "$1" -- sh -c "ip -o link | awk -F': ' '{print \$2}' | grep -E '^(wg|tun)[0-9]+\$' | head -n1" 2>/dev/null
+}
+
+vpn_configure_gateway() {
+  ((VPN_ENABLED)) || return 0
+
+  local ctid="${APP[gluetun.ctid]}" waited=0
+
+  msg_info "Attaching ${VPN_BRIDGE} to the Gluetun container..."
+  # net0 is left alone: Gluetun needs its LAN default route to build the tunnel.
+  $STD pct set "$ctid" -net1 "name=eth1,bridge=${VPN_BRIDGE},firewall=0,ip=${VPN_GW}/${VPN_MASK},type=veth"
+  # Gateway starts first. Upstream sets onboot but never a startup order.
+  $STD pct set "$ctid" -startup up=10
+  msg_ok "Gluetun dual-homed on ${VPN_BRIDGE}."
+
+  msg_info "Writing Gluetun configuration..."
+  _vpn_write_env "$ctid"
+  $STD pct exec "$ctid" -- systemctl restart gluetun
+  msg_ok "Gluetun configured."
+
+  msg_info "Waiting for the tunnel to come up..."
+  while ((waited < 120)); do
+    VPN_TUN_IF=$(_vpn_detect_tun_if "$ctid")
+    [[ -n "$VPN_TUN_IF" ]] && break
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  if [[ -z "$VPN_TUN_IF" ]]; then
+    msg_error "No tunnel interface appeared in the Gluetun container after ${waited}s."
+    msg_error "Check with: pct exec ${ctid} -- journalctl -u gluetun -n 50"
+    exit 1
+  fi
+  msg_ok "Tunnel up on ${VPN_TUN_IF}."
+
+  _vpn_install_gw_unit "$ctid"
+}
+
+# The hand build used iptables-persistent. netfilter-persistent has no ordering
+# relationship to gluetun.service, and Gluetun sets its own FORWARD policy to
+# DROP on start -- an ordered oneshot guarantees these rules land afterwards.
+_vpn_install_gw_unit() {
+  local ctid=$1 tmp
+
+  tmp=$(mktemp)
+  cat >"$tmp" <<'SCRIPT'
+#!/bin/sh
+# Re-detects the tunnel interface on every start: wg0 for WireGuard, tun0 for
+# OpenVPN, and it can change across a Gluetun restart.
+TUN=$(ip -o link | awk -F': ' '{print $2}' | grep -E '^(wg|tun)[0-9]+$' | head -n1)
+[ -n "$TUN" ] || exit 0
+
+# Each rule is guarded by a matching -C so re-runs do not grow the chain. The
+# reference build accumulated five duplicate rule sets without this.
+add() {
+  table=$1
+  shift
+  iptables -t "$table" -C "$@" 2>/dev/null || iptables -t "$table" -A "$@"
+}
+
+add nat POSTROUTING -o "$TUN" -j MASQUERADE
+add filter FORWARD -i eth1 -o "$TUN" -j ACCEPT
+add filter FORWARD -i "$TUN" -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+add filter FORWARD -i eth1 ! -o "$TUN" -j DROP
+# Not optional: wg0 MTU 1320 against eth0 MTU 1500 is what produces
+# "web UI loads fine, downloads stall at 0%".
+add mangle FORWARD -p tcp --syn -j TCPMSS --clamp-mss-to-pmtu
+SCRIPT
+  $STD pct push "$ctid" "$tmp" /usr/local/sbin/gluetun-gw.sh
+  $STD pct exec "$ctid" -- chmod 755 /usr/local/sbin/gluetun-gw.sh
+  rm -f "$tmp"
+
+  tmp=$(mktemp)
+  cat >"$tmp" <<'UNIT'
+[Unit]
+Description=Gluetun gateway forwarding rules
+After=gluetun.service
+Wants=gluetun.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gluetun-gw.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  $STD pct push "$ctid" "$tmp" /etc/systemd/system/gluetun-gw.service
+  rm -f "$tmp"
+
+  tmp=$(mktemp)
+  printf 'net.ipv4.ip_forward=1\n' >"$tmp"
+  $STD pct push "$ctid" "$tmp" /etc/sysctl.d/99-gluetun-gw.conf
+  rm -f "$tmp"
+
+  $STD pct exec "$ctid" -- sysctl -p /etc/sysctl.d/99-gluetun-gw.conf
+  $STD pct exec "$ctid" -- systemctl daemon-reload
+  $STD pct exec "$ctid" -- systemctl enable --now gluetun-gw.service
+  msg_ok "Forwarding rules installed and enabled."
+}
+
+vpn_convert_clients() {
+  ((VPN_ENABLED)) || return 0
+
+  local s ctid vpnip lanip startup=30
+
+  for s in "${ORDERED_SLUGS[@]}"; do
+    [[ "$s" == "gluetun" ]] && continue
+    _vpn_is_member "$s" || continue
+
+    ctid="${APP[$s.ctid]}"
+    vpnip="${APP[$s.vpnip]}"
+    lanip="${APP[$s.ip]}"
+
+    msg_info "Moving ${s} behind the tunnel..."
+
+    # Two rules that each cost a debugging session in the manual build: the
+    # default gateway lives on net0 ONLY (a second one is a coin-flip leak), and
+    # net1 gets no gw=. firewall=0 is explicit for determinism -- absent already
+    # means off, contrary to what the design doc originally claimed.
+    $STD pct set "$ctid" -net0 "name=eth0,bridge=${VPN_BRIDGE},firewall=0,gw=${VPN_GW},ip=${vpnip}/${VPN_MASK},type=veth"
+    $STD pct set "$ctid" -net1 "name=eth1,bridge=${var_bridge},firewall=0,ip=${lanip}/${var_cidr},type=veth"
+    # DNS through the gateway, which upstreams via the tunnel. A LAN resolver
+    # here would forward every indexer and tracker hostname over WAN in
+    # cleartext while the payload stayed tunnelled.
+    $STD pct set "$ctid" -nameserver "$VPN_GW"
+    # Clients must not start before the gateway has a tunnel.
+    $STD pct set "$ctid" -startup "up=${startup}"
+    startup=$((startup + 10))
+
+    _vpn_push_client_files "$ctid"
+
+    $STD pct reboot "$ctid"
+    if ! wait_for_port "$lanip" "${APP[$s.port]}" 120; then
+      msg_warn "${s} did not come back on ${lanip}:${APP[$s.port]} after the reboot."
+    fi
+
+    msg_ok "${s} is on ${vpnip} via ${VPN_GW} (LAN ${lanip})."
+  done
+}
+
+_vpn_push_client_files() {
+  local ctid=$1 tmp
+
+  # Loose reverse-path filtering on the management leg. Validation on an
+  # interface uses max(conf.all, conf.<iface>), and 2 is the highest valid
+  # value, so the interface key alone pins it whatever conf.all holds.
+  tmp=$(mktemp)
+  printf 'net.ipv4.conf.eth1.rp_filter=2\n' >"$tmp"
+  $STD pct push "$ctid" "$tmp" /etc/sysctl.d/99-rp.conf
+  rm -f "$tmp"
+  $STD pct exec "$ctid" -- sysctl -p /etc/sysctl.d/99-rp.conf
+
+  [[ -z "$VPN_MGMT_SUBNET" ]] && return 0
+
+  # After=sysinit.target, not network-online.target -- the latter frequently
+  # never fires in an LXC and leaves the unit waiting forever. And "ip route
+  # replace", not "add", which returns non-zero on an existing route and fails
+  # the unit. Never /etc/network/interfaces: Proxmox rewrites it on start.
+  tmp=$(mktemp)
+  {
+    printf '[Unit]\n'
+    printf 'After=sysinit.target\n\n'
+    printf '[Service]\n'
+    printf 'Type=oneshot\n'
+    printf 'RemainAfterExit=yes\n'
+    printf 'ExecStart=/sbin/ip route replace %s via %s dev eth1\n\n' "$VPN_MGMT_SUBNET" "$var_gateway"
+    printf '[Install]\n'
+    printf 'WantedBy=multi-user.target\n'
+  } >"$tmp"
+  $STD pct push "$ctid" "$tmp" /etc/systemd/system/mgmt-route.service
+  rm -f "$tmp"
+
+  $STD pct exec "$ctid" -- systemctl daemon-reload
+  $STD pct exec "$ctid" -- systemctl enable --now mgmt-route.service
+}
+
+# Runs before credential extraction, so a leaking build fails while there is
+# still nothing to report as success.
+vpn_verify() {
+  ((VPN_ENABLED)) || return 0
+
+  local gw_ctid="${APP[gluetun.ctid]}"
+  local s ctid routes rp exit_ip first_ip="" failures=0
+
+  msg_step "Verifying the VPN gateway"
+
+  for s in "${ORDERED_SLUGS[@]}"; do
+    [[ "$s" == "gluetun" ]] && continue
+    _vpn_is_member "$s" || continue
+    ctid="${APP[$s.ctid]}"
+
+    # 1. Exactly one default route, and it points at the VPN gateway.
+    routes=$(pct exec "$ctid" -- sh -c "ip route | grep -c '^default'" 2>/dev/null || echo 0)
+    if [[ "$routes" != "1" ]]; then
+      msg_error "${s}: expected exactly 1 default route, found ${routes}."
+      failures=$((failures + 1))
+    elif ! pct exec "$ctid" -- sh -c "ip route | grep -q '^default via ${VPN_GW}'" 2>/dev/null; then
+      msg_error "${s}: default route does not go via ${VPN_GW}."
+      failures=$((failures + 1))
+    fi
+
+    # 2. Every member egresses the same address.
+    exit_ip=$(pct exec "$ctid" -- curl -s -m10 ifconfig.me 2>/dev/null || true)
+    if [[ -z "$exit_ip" ]]; then
+      msg_error "${s}: could not determine an exit IP."
+      failures=$((failures + 1))
+    elif [[ -z "$first_ip" ]]; then
+      first_ip="$exit_ip"
+      msg_ok "${s} egresses ${exit_ip}"
+    elif [[ "$exit_ip" != "$first_ip" ]]; then
+      msg_error "${s}: egresses ${exit_ip}, expected ${first_ip}."
+      failures=$((failures + 1))
+    else
+      msg_ok "${s} egresses ${exit_ip}"
+    fi
+
+    # 3. Loose rp_filter on the management leg.
+    rp=$(pct exec "$ctid" -- sysctl -n net.ipv4.conf.eth1.rp_filter 2>/dev/null || echo "")
+    if [[ "$rp" != "2" ]]; then
+      msg_error "${s}: eth1 rp_filter is '${rp}', expected 2."
+      failures=$((failures + 1))
+    fi
+
+    if [[ -n "$VPN_MGMT_SUBNET" ]] \
+      && ! pct exec "$ctid" -- sh -c "ip route | grep -q '${VPN_MGMT_SUBNET}'" 2>/dev/null; then
+      msg_error "${s}: management route to ${VPN_MGMT_SUBNET} is missing."
+      failures=$((failures + 1))
+    fi
+  done
+
+  # The control server reports an empty public_ip even on a healthy tunnel, so
+  # it is advisory only -- the client comparison above is what actually gates.
+  local ctrl_ip
+  ctrl_ip=$(pct exec "$gw_ctid" -- curl -s -m10 http://127.0.0.1:8000/v1/publicip/ip 2>/dev/null || true)
+  msg_info "Gluetun control server reports: ${ctrl_ip:-<unavailable>}"
+
+  # 4. The rules survive a Gluetun restart, which resets its own chains.
+  msg_info "Restarting Gluetun to confirm the rules are re-applied..."
+  $STD pct exec "$gw_ctid" -- systemctl restart gluetun
+  sleep 15
+  $STD pct exec "$gw_ctid" -- systemctl restart gluetun-gw.service
+  if ! pct exec "$gw_ctid" -- sh -c "iptables -S FORWARD | grep -q 'eth1 ! -o'" 2>/dev/null; then
+    msg_error "The FORWARD kill-switch rule did not survive a Gluetun restart."
+    failures=$((failures + 1))
+  fi
+
+  _vpn_killswitch_test || failures=$((failures + 1))
+
+  if ((failures > 0)); then
+    msg_error "VPN verification failed with ${failures} problem(s)."
+    msg_error "Containers were left in place. A silently leaking build is worse than a failed one."
+    exit 1
+  fi
+
+  msg_ok "VPN verification passed."
+}
+
+# Stop the tunnel and confirm a client cannot reach the internet at all. Any
+# answer here means traffic has a path to WAN that bypasses the VPN.
+_vpn_killswitch_test() {
+  local probe="" s leaked
+
+  for s in "${ORDERED_SLUGS[@]}"; do
+    [[ "$s" == "gluetun" ]] && continue
+    if _vpn_is_member "$s"; then probe="${APP[$s.ctid]}"; break; fi
+  done
+  [[ -z "$probe" ]] && return 0
+
+  msg_info "Kill-switch test: stopping Gluetun..."
+  $STD pct exec "${APP[gluetun.ctid]}" -- systemctl stop gluetun
+  sleep 5
+
+  leaked=$(pct exec "$probe" -- curl -s -m10 ifconfig.me 2>/dev/null || true)
+
+  $STD pct exec "${APP[gluetun.ctid]}" -- systemctl start gluetun
+  sleep 10
+
+  if [[ -n "$leaked" ]]; then
+    msg_error "KILL SWITCH FAILED: a client still reached the internet as ${leaked} with Gluetun stopped."
+    return 1
+  fi
+
+  msg_ok "Kill switch holds -- no route to WAN without the tunnel."
+  return 0
+}
