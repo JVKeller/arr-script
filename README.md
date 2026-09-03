@@ -4,6 +4,9 @@ A Proxmox VE helper script to automate deployment and configuration of a basic c
 
 ## What is Included
 
+### New Development...
+- **Glutun** (VPN Gateway container!!!)
+
 ### Working
 - **Prowlarr** (indexers)
 - **Sonarr** (TV)
