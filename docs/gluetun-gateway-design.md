@@ -118,17 +118,20 @@ Netherlands), 210 exits `98.17.49.225` (the ISP). The role split works.
 - **Addressing is spaced, not sequential.** Reality is `.10` (qbittorrent) and
   `.20` (prowlarr), not `.10, .11, .12`. Either scheme works; pick one
   deliberately rather than inheriting the plan's by accident.
+- **The `rp_filter` guidance is backwards.** The plan says "the kernel takes the
+  max of the two, so setting only the interface does nothing." Validation on an
+  interface uses `max(conf.all.rp_filter, conf.<iface>.rp_filter)`, and `2`
+  (loose) is the highest valid value — so setting the **interface key alone is
+  sufficient** and pins the effective value at 2 whatever `all` holds. CT 219
+  sets only `eth1` and is correct. CT 215 additionally sets `all=2`, which
+  applies loose mode to every interface including `eth0` — harmless here, but
+  broader than needed. Write the interface key; the `all` key is optional.
 
 ### Defects in the reference build — do not port these
 
-1. **CT 219's `/etc/sysctl.d/99-rp.conf` sets only
-   `net.ipv4.conf.eth1.rp_filter=2`, omitting the `all` key.** CT 215 has both.
-   Runtime currently reads 2 on 219, but that file will not reproduce it on a
-   rebuild. This is exactly the failure the plan warns about — the kernel takes
-   the max of `all` and the interface, so the interface key alone is not
-   sufficient. **Write both. 215 is the correct model, 219 is not.**
-2. **`/opt/gluetun-data/.env` is mode 644 and holds the WireGuard private key.**
-   The plan's `chmod 600` is a genuine improvement; keep it.
+1. **`/opt/gluetun-data/.env` is mode 644 and holds the WireGuard private key.**
+   Low severity on a single-purpose container, but the plan's `chmod 600` is
+   free and worth keeping.
 3. **`TZ=UTC` in the `.env`** while the container timezone is
    `America/New_York`. The plan's "TZ from `timedatectl`" is correct.
 4. `netfilter-persistent` is what persists rules today, with no ordering
