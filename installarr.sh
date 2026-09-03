@@ -950,6 +950,12 @@ install_loop() {
 
     progress "$half_pct" "[${idx}/${total}] Installing ${s} -> ctid=${ctid} ip=${ip}/${var_cidr}"
 
+    # stdin from "yes n": upstream install scripts carry unguarded read prompts
+    # for optional extras (sabnzbd asks about par2cmdline-turbo), and /dev/null
+    # made those reads hit EOF and abort the install. Nothing we install needs a
+    # "y". Keep this as process substitution, not `yes n | ...`: under the
+    # `set -o pipefail` at the top of this file, the SIGPIPE that kills `yes`
+    # returns 141 and fails every install.
     $STD env \
       MODE=generated mode=generated PHS_SILENT=1 \
       VERBOSE="$VERBOSE" var_verbose="$VERBOSE" \
