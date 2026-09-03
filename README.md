@@ -60,7 +60,9 @@ var_gateway=192.168.1.1 \
 var_cidr=24 \
 var_start_ctid=100 \
 var_qbt_password=MyStrongPassword \
-SUMMARY_FILE=/root/installarr-summary.txt \nSTATE_FILE=/root/installarr-state.conf \nvar_installarr_ref=main \
+SUMMARY_FILE=/root/installarr-summary.txt \
+STATE_FILE=/root/installarr-state.conf \
+var_installarr_ref=main \
 sudo bash installarr.sh
 ```
 
