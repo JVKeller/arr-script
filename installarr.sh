@@ -34,10 +34,25 @@ var_start_ctid="${var_start_ctid:-}"
 var_repo="${var_repo:-ProxmoxVE}"
 var_qbt_password="${var_qbt_password:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-/root/installarr-summary.txt}"
+STATE_FILE="${STATE_FILE:-/root/installarr-state.conf}"
+# Helper files are fetched from this repo at the same ref as the installer,
+# so a pinned installer never pairs itself with a drifted helper.
+var_installarr_repo="${var_installarr_repo:-JVKeller/arr-script}"
+var_installarr_ref="${var_installarr_ref:-main}"
 # Read by upstream set_std_mode(): "yes" leaves STD empty so output streams.
 VERBOSE="${VERBOSE:-no}"
 
 QBT_PERMANENT=0
+
+# All five are replaced by installarr-vpn.func when the user opts into the VPN
+# gateway. main() calls them unconditionally, so they must exist even when the
+# module is never fetched -- otherwise declining the VPN trips `set -e`.
+VPN_ENABLED=0
+vpn_prompt_settings()   { :; }
+vpn_plan_addresses()    { :; }
+vpn_ensure_bridge()     { :; }
+vpn_configure_gateway() { :; }
+vpn_summary_lines()     { :; }
 
 BACKTITLE="Proxmox VE Helper Scripts — Installarr"
 
@@ -302,6 +317,7 @@ seerr|seerr.sh|5055||-|requests|Seerr|
 jellyfin|jellyfin.sh|8096|Jellyfin|-|media|Jellyfin|
 qbittorrent|qbittorrent.sh|8090|QBittorrent|-|client|qBittorrent|QBittorrentSettings
 sabnzbd|sabnzbd.sh|7777|Sabnzbd|-|client|SABnzbd|SabnzbdSettings
+gluetun|gluetun.sh|8000|||vpn|Gluetun|
 EOF
 }
 
@@ -525,8 +541,64 @@ pick_qbittorrent_password() {
   done
 }
 
+# Fetched only after the user opts in, mirroring how core.func/tools.func are
+# sourced at the top of this file. installarr-vpn.sh is left on disk for the
+# operator to run later -- the summary tells them to.
+pick_vpn() {
+  local base="https://raw.githubusercontent.com/${var_installarr_repo}/${var_installarr_ref}"
+
+  if ! curl -fsSL "${base}/installarr-vpn.func" -o "$TEMP_DIR/installarr-vpn.func"; then
+    msg_warn "Could not fetch installarr-vpn.func; skipping the VPN gateway option."
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  source "$TEMP_DIR/installarr-vpn.func"
+
+  vpn_prompt_settings
+  (( VPN_ENABLED )) || return 0
+
+  if curl -fsSL "${base}/installarr-vpn.sh" -o /root/installarr-vpn.sh; then
+    chmod +x /root/installarr-vpn.sh
+    msg_ok "Post-install script saved to /root/installarr-vpn.sh"
+  else
+    msg_warn "Could not fetch installarr-vpn.sh -- download it manually before finishing VPN setup."
+  fi
+}
+
+# Written on every run, VPN or not: a machine-readable record of what was built,
+# so the stack can be extended later without re-running the installer.
+write_state() {
+  local s
+  {
+    echo "# Written by installarr.sh on $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "LAN_BRIDGE=${var_bridge}"
+    echo "LAN_GW=${var_gateway}"
+    echo "LAN_CIDR=${var_cidr}"
+    echo "VPN_ENABLED=${VPN_ENABLED}"
+    echo "VPN_BRIDGE=${VPN_BRIDGE:-}"
+    echo "VPN_GW=${VPN_GW:-}"
+    echo "VPN_MASK=${VPN_MASK:-}"
+    echo "VPN_SUBNET=${VPN_SUBNET:-}"
+    echo "VPN_MGMT_SUBNET=${VPN_MGMT_SUBNET:-}"
+    echo "GLUETUN_CTID=${APP[gluetun.ctid]:-}"
+    echo "GLUETUN_LAN_IP=${APP[gluetun.ip]:-}"
+    # slug:ctid:lan_ip:port:kind:planned_vpn_ip -- the VPN address is empty for
+    # anything that is not a tunnel member, and for every container when no VPN
+    # was configured. installarr-vpn.sh treats a non-empty one as "convert me".
+    printf 'CONTAINERS="'
+    for s in "${ORDERED_SLUGS[@]}"; do
+      printf '%s:%s:%s:%s:%s:%s '         "$s" "${APP[$s.ctid]:-}" "${APP[$s.ip]:-}" "${APP[$s.port]:-}"         "${APP[$s.kind]:-}" "${APP[$s.vpnip]:-}"
+    done
+    echo '"'
+  } >"$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+  msg_ok "Wrote ${STATE_FILE}"
+}
+
 compute_ordered_slugs() {
-  ORDERED_SLUGS=("prowlarr")
+  ORDERED_SLUGS=()
+  (( VPN_ENABLED )) && ORDERED_SLUGS+=("gluetun")
+  ORDERED_SLUGS+=("prowlarr")
   local s
   for s in $SELECTED_ARRS; do
     [[ "$s" == "seerr" ]] && continue
@@ -1507,6 +1579,11 @@ write_summary() {
   lines+=( "\e[1;31m------------------------------------------------------------\e[0m" )
   lines+=( "" )
   lines+=( "Summary written to \e[36m${SUMMARY_FILE}\e[0m (chmod 600)." )
+  if (( VPN_ENABLED )); then
+    local vpn_line
+    while IFS= read -r vpn_line; do lines+=( "$vpn_line" ); done < <(vpn_summary_lines)
+  fi
+
   lines+=( "\e[1;36m============================================================\e[0m" )
 
   local body
@@ -1539,15 +1616,20 @@ main() {
   pick_jellyfin
   pick_qbittorrent_password
   pick_example_indexer
+  pick_vpn
   compute_ordered_slugs
   pick_ip_mode_and_ips
   pick_ctids
   pick_verbose
+  vpn_plan_addresses
+  vpn_ensure_bridge
   confirm_summary
   prepare_templates
   install_loop
+  vpn_configure_gateway
   wait_and_extract_keys
   wire_apis
+  write_state
   write_summary
   msg_ok "Installarr provisioning finished."
 }

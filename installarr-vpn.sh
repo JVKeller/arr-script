@@ -8,7 +8,7 @@
 # bridge has no physical uplink: moving containers onto it without a working
 # tunnel leaves them with no internet at all.
 #
-# Reads the state installarr.sh wrote to /root/installarr-vpn.conf.
+# Reads the state installarr.sh wrote to /root/installarr-state.conf.
 #
 # Safe to re-run. Every step is idempotent.
 
@@ -25,7 +25,7 @@ msg_warn() { echo -e " ${YW}[WARN]${CL} ${1}"; }
 msg_err() { echo -e " ${RD}[x]${CL} ${1}"; }
 msg_step() { echo -e "\n${BL}==>${CL} ${1}"; }
 
-STATE_FILE="${VPN_STATE_FILE:-/root/installarr-vpn.conf}"
+STATE_FILE="${STATE_FILE:-/root/installarr-state.conf}"
 ASSUME_YES=0
 [[ "${1:-}" == "-y" || "${1:-}" == "--yes" ]] && ASSUME_YES=1
 
@@ -50,12 +50,34 @@ fi
 # shellcheck source=/dev/null
 source "$STATE_FILE"
 
-for v in VPN_BRIDGE VPN_GW VPN_MASK LAN_BRIDGE LAN_GW LAN_CIDR GLUETUN_CTID MEMBERS; do
+if [[ "${VPN_ENABLED:-0}" != "1" ]]; then
+  msg_err "That installarr run did not install a Gluetun gateway."
+  msg_err "Re-run installarr.sh and choose the VPN gateway option."
+  exit 1
+fi
+
+for v in VPN_BRIDGE VPN_GW VPN_MASK LAN_BRIDGE LAN_GW LAN_CIDR GLUETUN_CTID CONTAINERS; do
   [[ -n "${!v:-}" ]] || {
     msg_err "${STATE_FILE} is missing ${v}."
     exit 1
   }
 done
+
+# CONTAINERS holds every container installarr built, as
+# slug:ctid:lan_ip:port:kind:planned_vpn_ip. A member is one with a planned VPN
+# address -- Jellyfin and Seerr are recorded but have none, so they are skipped.
+MEMBERS=""
+for _c in $CONTAINERS; do
+  IFS=: read -r _slug _ctid _lan _port _kind _vpnip <<<"$_c"
+  [[ "$_slug" == "gluetun" ]] && continue
+  [[ -n "$_vpnip" ]] || continue
+  MEMBERS+="${_slug}:${_ctid}:${_lan}:${_vpnip}:${_port} "
+done
+
+if [[ -z "${MEMBERS// /}" ]]; then
+  msg_err "No containers in ${STATE_FILE} are marked for the tunnel."
+  exit 1
+fi
 
 msg_step "Preflight"
 
