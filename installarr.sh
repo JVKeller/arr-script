@@ -950,8 +950,6 @@ install_loop() {
 
     progress "$half_pct" "[${idx}/${total}] Installing ${s} -> ctid=${ctid} ip=${ip}/${var_cidr}"
 
-    # stdin from /dev/null: any prompt upstream adds in future fails fast and
-    # visibly instead of hanging forever behind the gauge.
     $STD env \
       MODE=generated mode=generated PHS_SILENT=1 \
       VERBOSE="$VERBOSE" var_verbose="$VERBOSE" \
@@ -962,7 +960,7 @@ install_loop() {
       var_gateway="$var_gateway" \
       var_container_storage="$var_container_storage" \
       var_template_storage="$var_template_storage" \
-      bash "$script_file" </dev/null
+      bash "$script_file" < <(yes n)
 
     INSTALLED_SLUGS+=("$s")
 
