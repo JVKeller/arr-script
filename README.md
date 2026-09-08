@@ -60,25 +60,28 @@ var_template_storage=local \
 var_bridge=vmbr0 \
 var_gateway=192.168.1.1 \
 var_cidr=24 \
+var_vlan=20 \
 var_start_ctid=100 \
 var_qbt_password=MyStrongPassword \
+INSTALL_MODE=advanced \
 SUMMARY_FILE=/root/installarr-summary.txt \
 sudo bash installarr.sh
 ```
 
 ## Workflow
 
-1. **Storage & Network Selection** — Choose container storage, template storage, network bridge, gateway, CIDR
-2. **App Selection** — Pick which *arr apps, media server, and download clients to install
-3. **Example Indexer Prompt** — Optionally seed Prowlarr with a disabled public indexer
-4. **IP Assignment** — Enter IPs for each container (interactive form or list mode)
-5. **CTID Allocation** — Set starting container ID (auto-increments for used IDs)
-6. **Confirmation** — Review full config before deployment
-7. **Template Preparation** — Verifies and downloads any LXC templates the selected apps require
-8. **Installation** — Downloads and deploys each container with progress gauge
-9. **Credential Extraction** — Waits for startup, extracts API keys
-10. **API Wiring** — Connects Prowlarr → Sonarr/Radarr/Lidarr, adds qBittorrent/SABnzbd to *arr apps, wires Bazarr
-11. **Summary** — Displays URLs, credentials, and manual next steps
+1. **Install Mode** — `default` for a flat untagged network, or `advanced` to also set a VLAN tag
+2. **Storage & Network Selection** — Choose container storage, template storage, network bridge, gateway, CIDR, and (advanced only) the VLAN tag applied to every container
+3. **App Selection** — Pick which *arr apps, media server, and download clients to install
+4. **Example Indexer Prompt** — Optionally seed Prowlarr with a disabled public indexer
+5. **IP Assignment** — Enter IPs for each container (interactive form or list mode)
+6. **CTID Allocation** — Set starting container ID (auto-increments for used IDs)
+7. **Confirmation** — Review full config before deployment
+8. **Template Preparation** — Verifies and downloads any LXC templates the selected apps require
+9. **Installation** — Downloads and deploys each container with progress gauge
+10. **Credential Extraction** — Waits for startup, extracts API keys
+11. **API Wiring** — Connects Prowlarr → Sonarr/Radarr/Lidarr, adds qBittorrent/SABnzbd to *arr apps, wires Bazarr
+12. **Summary** — Displays URLs, credentials, and manual next steps
 
 ## Manual Steps Still Required
 

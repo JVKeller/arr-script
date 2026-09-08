@@ -30,12 +30,18 @@ var_template_storage="${var_template_storage:-}"
 var_bridge="${var_bridge:-}"
 var_gateway="${var_gateway:-}"
 var_cidr="${var_cidr:-24}"
+var_vlan="${var_vlan:-}"
 var_start_ctid="${var_start_ctid:-}"
 var_repo="${var_repo:-ProxmoxVE}"
 var_qbt_password="${var_qbt_password:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-/root/installarr-summary.txt}"
 # Read by upstream set_std_mode(): "yes" leaves STD empty so output streams.
 VERBOSE="${VERBOSE:-no}"
+
+# Governs the optional prompts. "default" leaves them at their standard
+# values without asking; "advanced" collects them. Preset in the environment
+# to skip the mode dialog.
+INSTALL_MODE="${INSTALL_MODE:-}"
 
 QBT_PERMANENT=0
 
@@ -272,6 +278,15 @@ is_valid_ipv4() {
   return 0
 }
 
+# Blank is valid and means untagged -- upstream build.func reads an empty
+# var_vlan as "no VLAN" rather than an error.
+is_valid_vlan_tag() {
+  local tag=$1
+  [[ -z "$tag" ]] && return 0
+  [[ "$tag" =~ ^[0-9]+$ ]] || return 1
+  (( tag >= 1 && tag <= 4094 ))
+}
+
 form_input_program() {
   if command -v dialog >/dev/null 2>&1; then
     echo "dialog"
@@ -303,6 +318,22 @@ jellyfin|jellyfin.sh|8096|Jellyfin|-|media|Jellyfin|
 qbittorrent|qbittorrent.sh|8090|QBittorrent|-|client|qBittorrent|QBittorrentSettings
 sabnzbd|sabnzbd.sh|7777|Sabnzbd|-|client|SABnzbd|SabnzbdSettings
 EOF
+}
+
+# "default" is the flat untagged LAN most home setups run, so it asks nothing
+# extra; "advanced" adds the VLAN tag prompt.
+pick_install_mode() {
+  if [[ "$INSTALL_MODE" == "default" || "$INSTALL_MODE" == "advanced" ]]; then
+    msg_info "Install mode (from env): ${INSTALL_MODE}"
+    return 0
+  fi
+
+  INSTALL_MODE=$(whiptail --backtitle "$BACKTITLE" \
+    --title "Install Mode" \
+    --menu "How much do you want to be asked about the network?" 15 74 2 \
+    "default"  "Standard settings, untagged network" \
+    "advanced" "Also set a VLAN tag for the containers" \
+    3>&1 1>&2 2>&3) || cancelled "install mode pick"
 }
 
 pick_storage() {
@@ -404,6 +435,42 @@ pick_network_defaults() {
   done
 
   msg_info "Bridge ${var_bridge} | gateway ${var_gateway} | mask /${var_cidr}"
+}
+
+# Only asked in advanced mode. Blank stays a legitimate answer either way: an
+# empty var_vlan is exactly how upstream expresses "untagged".
+pick_vlan_tag() {
+  if [[ "$INSTALL_MODE" != "advanced" ]]; then
+    var_vlan=""
+    return 0
+  fi
+
+  if [[ -n "$var_vlan" ]] && is_valid_vlan_tag "$var_vlan"; then
+    msg_info "VLAN tag ${var_vlan} (from env)"
+    return 0
+  fi
+
+  local answer="$var_vlan"
+  while true; do
+    answer=$(whiptail --backtitle "$BACKTITLE" \
+      --title "VLAN Tag" \
+      --inputbox "VLAN tag applied to every container on ${var_bridge} (1-4094).\n\nLeave blank if ${var_bridge} is not VLAN-aware or your network is untagged." 12 72 \
+      "$answer" 3>&1 1>&2 2>&3) || cancelled "VLAN tag prompt"
+
+    if is_valid_vlan_tag "$answer"; then
+      var_vlan="$answer"
+      break
+    fi
+
+    whiptail --backtitle "$BACKTITLE" --title "Invalid" \
+      --msgbox "VLAN tag must be an integer between 1 and 4094, or blank for no VLAN.\n\nGot: ${answer}" 10 64
+  done
+
+  if [[ -n "$var_vlan" ]]; then
+    msg_info "VLAN tag ${var_vlan}"
+  else
+    msg_info "No VLAN tag (untagged)"
+  fi
 }
 
 pick_apps() {
@@ -885,7 +952,7 @@ confirm_summary() {
       "$s" "${APP[$s.ctid]}" "${APP[$s.ip]}" "${APP[$s.port]}")"$'\n'
   done
 
-  local body="About to create these containers and wire them together:"$'\n\n'"${lines}"$'\n'"Storage: ${var_container_storage} | Bridge: ${var_bridge} | Gateway: ${var_gateway} | Mask: /${var_cidr}"
+  local body="About to create these containers and wire them together:"$'\n\n'"${lines}"$'\n'"Storage: ${var_container_storage} | Bridge: ${var_bridge} | Gateway: ${var_gateway} | Mask: /${var_cidr}${var_vlan:+ | VLAN: ${var_vlan}}"
 
   whiptail --backtitle "$BACKTITLE" --title "Confirm" \
     --yesno "$body" 22 78 || { msg_warn "User cancelled."; exit 0; }
@@ -964,6 +1031,7 @@ install_loop() {
       var_brg="$var_bridge" \
       var_net="${ip}/${var_cidr}" \
       var_gateway="$var_gateway" \
+      var_vlan="$var_vlan" \
       var_container_storage="$var_container_storage" \
       var_template_storage="$var_template_storage" \
       bash "$script_file" < <(yes n)
@@ -1482,6 +1550,7 @@ write_summary() {
   lines+=( "  Bridge:     ${var_bridge}" )
   lines+=( "  Gateway:    ${var_gateway}" )
   lines+=( "  CIDR:       /${var_cidr}" )
+  lines+=( "  VLAN:       ${var_vlan:-none}" )
   lines+=( "  CT storage: ${var_container_storage}" )
   lines+=( "  Template:   ${var_template_storage}" )
   lines+=( "" )
@@ -1602,8 +1671,10 @@ main() {
   check_pve_tools
   ensure_dependencies curl whiptail jq iputils-ping
   seed_catalog
+  pick_install_mode
   pick_storage
   pick_network_defaults
+  pick_vlan_tag
   pick_apps
   pick_clients
   pick_jellyfin
