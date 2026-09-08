@@ -44,7 +44,7 @@ Derived from [@michelroegl-brunner's](https://github.com/michelroegl-brunner) or
 To use this version, manually download to your PVE host and run it.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JVKeller/arr-script/main/installarr.sh -o installarr.sh
+curl -fsSL https://raw.githubusercontent.com/JVKeller/arr-script/glutun-gateway/installarr.sh -o installarr.sh
 bash installarr.sh
 ```
 
