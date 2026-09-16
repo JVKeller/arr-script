@@ -63,6 +63,12 @@ for v in VPN_BRIDGE VPN_GW VPN_MASK LAN_BRIDGE LAN_GW LAN_CIDR GLUETUN_CTID CONT
   }
 done
 
+# Optional: absent or empty means an untagged container LAN. State files
+# written before VLAN support carry no LAN_VLAN key at all, so this must
+# stay out of the required-var loop above.
+LAN_TAG=""
+[[ -n "${LAN_VLAN:-}" ]] && LAN_TAG=",tag=${LAN_VLAN}"
+
 # CONTAINERS holds every container installarr built, as
 # slug:ctid:lan_ip:port:kind:planned_vpn_ip. A member is one with a planned VPN
 # address -- Jellyfin and Seerr are recorded but have none, so they are skipped.
@@ -175,7 +181,7 @@ for m in $MEMBERS; do
   # default gateway lives on net0 ONLY -- a second one is a coin-flip leak --
   # and net1 gets no gw=. firewall=0 is explicit for determinism.
   pct set "$ctid" -net0 "name=eth0,bridge=${VPN_BRIDGE},firewall=0,gw=${VPN_GW},ip=${vpnip}/${VPN_MASK},type=veth"
-  pct set "$ctid" -net1 "name=eth1,bridge=${LAN_BRIDGE},firewall=0,ip=${lanip}/${LAN_CIDR},type=veth"
+  pct set "$ctid" -net1 "name=eth1,bridge=${LAN_BRIDGE}${LAN_TAG},firewall=0,ip=${lanip}/${LAN_CIDR},type=veth"
   # DNS through the gateway, which upstreams via the tunnel. A LAN resolver here
   # would forward every indexer and tracker hostname over WAN in cleartext while
   # the payload stayed tunnelled.
@@ -312,4 +318,4 @@ fi
 msg_ok "All members are behind the tunnel, egressing ${first_ip}."
 echo
 echo "Re-run this script any time to re-verify. To undo, point each"
-echo "container's net0 back at ${LAN_BRIDGE} with gw=${LAN_GW}."
+echo "container's net0 back at ${LAN_BRIDGE}${LAN_TAG} with gw=${LAN_GW}."
