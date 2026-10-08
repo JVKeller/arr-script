@@ -50,6 +50,13 @@ curl -fsSL https://raw.githubusercontent.com/JVKeller/arr-script/main/installarr
 bash installarr.sh
 ```
 
+## Recommendations
+It is highly recommended to use a VPN for your arr-stack traffic. This version does not have a VPN set up with it, so
+you would be on your own to set that up.
+
+If you would like the add the addition of a Gluten VPN container to route your traffic though and keep your data private,
+Please switch to the Glutun branch to integrate a VPN service like Surfshark while it's being finalized.
+
 ### Environment Variables (Optional)
 
 Pre-configure settings to skip prompts:
