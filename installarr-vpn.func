@@ -147,7 +147,7 @@ vpn_plan_addresses() {
   local s base host=10
   base=$(_net_of "$VPN_GW" "$VPN_MASK")
 
-  for s in "${ORDERED_SLUGS[@]}"; do
+  for s in "${ORDERED_SLUGS[@]}" "${EXISTING_SLUGS[@]}"; do
     [[ "$s" == "gluetun" ]] && { APP[$s.vpnip]="$VPN_GW"; continue; }
     if _vpn_is_member "$s"; then
       APP[$s.vpnip]=$(_int_to_ip $((base + host)))
@@ -166,6 +166,10 @@ vpn_configure_gateway() {
   $STD pct set "$ctid" -net1 "name=eth1,bridge=${VPN_BRIDGE},firewall=0,ip=${VPN_GW}/${VPN_MASK},type=veth"
   # Gateway starts first. Upstream sets onboot but never a startup order.
   $STD pct set "$ctid" -startup up=10
+  # Proxmox's inherited search domain (local.) sends lookups into a DNS loop.
+  $STD pct set "$ctid" -searchdomain ""
+  # Applies the search domain; safe because the gateway is still inert.
+  $STD pct reboot "$ctid"
   msg_ok "Gluetun dual-homed on ${VPN_BRIDGE} at ${VPN_GW}."
 
   _vpn_install_gw_unit "$ctid"
@@ -266,8 +270,9 @@ To finish, on the Proxmox host:
 
        pct exec ${APP[gluetun.ctid]} -- nano /opt/gluetun-data/.env
 
-     At minimum you need VPN_SERVICE_PROVIDER, VPN_TYPE, and the
-     provider's credentials. For WireGuard that is
+     First remove the helper script's default OPENVPN_* and
+     VPN_SERVICE_PROVIDER=custom entries. Then, at minimum, you need
+     VPN_SERVICE_PROVIDER, VPN_TYPE, and the provider's credentials. For WireGuard that is
      WIREGUARD_PRIVATE_KEY and WIREGUARD_ADDRESSES.
 
      WIREGUARD_ADDRESSES must be the address AND prefix from your
@@ -300,7 +305,7 @@ These containers will be moved behind the tunnel in step 3:
 
 EOF
 
-  for s in "${ORDERED_SLUGS[@]}"; do
+  for s in "${ORDERED_SLUGS[@]}" "${EXISTING_SLUGS[@]}"; do
     [[ "$s" == "gluetun" ]] && continue
     _vpn_is_member "$s" || continue
     printf '  %-14s LAN %-15s -> VPN %s\n' "$s" "${APP[$s.ip]}" "${APP[$s.vpnip]}"
@@ -312,7 +317,7 @@ Left on the LAN deliberately (tunnelling them breaks remote access):
 
 EOF
 
-  for s in "${ORDERED_SLUGS[@]}"; do
+  for s in "${ORDERED_SLUGS[@]}" "${EXISTING_SLUGS[@]}"; do
     [[ "$s" == "gluetun" ]] && continue
     _vpn_is_member "$s" && continue
     printf '  %-14s %s\n' "$s" "${APP[$s.ip]}"

@@ -186,6 +186,8 @@ for m in $MEMBERS; do
   # would forward every indexer and tracker hostname over WAN in cleartext while
   # the payload stayed tunnelled.
   pct set "$ctid" -nameserver "$VPN_GW"
+  # Proxmox's inherited search domain (local.) sends lookups into a DNS loop.
+  pct set "$ctid" -searchdomain ""
   # Must not start before the gateway has a tunnel.
   pct set "$ctid" -startup "up=${startup}"
   startup=$((startup + 10))
@@ -199,15 +201,20 @@ for m in $MEMBERS; do
     # After=sysinit.target, not network-online.target -- the latter frequently
     # never fires in an LXC and leaves the unit waiting forever. And "ip route
     # replace", not "add", which returns non-zero on an existing route and
-    # fails the unit. Never /etc/network/interfaces: Proxmox rewrites it.
+    # fails the unit. Restart=on-failure because at early boot eth1 can be up
+    # before the LAN gateway is reachable ("Nexthop has invalid gateway").
+    # Never /etc/network/interfaces: Proxmox rewrites it.
     push_file "$ctid" /etc/systemd/system/mgmt-route.service <<UNIT
 [Unit]
 After=sysinit.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/sbin/ip route replace ${VPN_MGMT_SUBNET} via ${LAN_GW} dev eth1
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
@@ -233,6 +240,11 @@ msg_step "Verifying"
 failures=0
 first_ip=""
 
+# Gluetun's own view of the tunnel's public IP; members must match it.
+gw_ip=$(pct exec "$GLUETUN_CTID" -- curl -s -m10 http://127.0.0.1:8000/v1/publicip/ip 2>/dev/null |
+  sed -n 's/.*"public_ip" *: *"\([^"]*\)".*/\1/p' || true)
+[[ -n "$gw_ip" ]] && first_ip="$gw_ip"
+
 for m in $MEMBERS; do
   IFS=: read -r slug ctid _lanip _vpnip _port <<<"$m"
 
@@ -257,8 +269,19 @@ for m in $MEMBERS; do
     failures=$((failures + 1))
   fi
 
-  # The real test. Gluetun's own /v1/publicip/ip returns empty even on a healthy
-  # tunnel, so comparing members to each other is what actually proves this.
+  if [[ -n "${VPN_MGMT_SUBNET:-}" ]] &&
+    ! pct exec "$ctid" -- systemctl is-active --quiet mgmt-route.service 2>/dev/null; then
+    msg_err "${slug}: mgmt-route.service is not active."
+    failures=$((failures + 1))
+  fi
+
+  if ! pct exec "$ctid" -- getent hosts github.com >/dev/null 2>&1; then
+    msg_err "${slug}: cannot resolve github.com through the gateway."
+    failures=$((failures + 1))
+  fi
+
+  # The real test: every member must egress the gateway's own public IP (or,
+  # if its API gave none, the first member's).
   exit_ip=$(pct exec "$ctid" -- curl -s -m15 ifconfig.me 2>/dev/null || true)
   if [[ -z "$exit_ip" ]]; then
     msg_err "${slug}: no exit IP -- it may have no route at all."
@@ -273,6 +296,17 @@ for m in $MEMBERS; do
     msg_ok "${slug} egresses ${exit_ip}"
   fi
 done
+
+dns_warns=$(pct exec "$GLUETUN_CTID" -- sh -c "journalctl -u gluetun --since '1 minute ago' --no-pager 2>/dev/null | grep -ci 'warn.*\[dns\]'" 2>/dev/null || true)
+if [[ "${dns_warns:-0}" != "0" ]]; then
+  msg_err "Gateway logged ${dns_warns} [dns] warning(s) in the last minute."
+  failures=$((failures + 1))
+fi
+
+gw_cpu=$(pct exec "$GLUETUN_CTID" -- sh -c "top -bn2 -d1 | grep -w gluetun | tail -n1 | awk '{print \$9}'" 2>/dev/null || true)
+if [[ -n "$gw_cpu" ]] && (( ${gw_cpu%.*} >= 20 )); then
+  msg_warn "Gluetun is using ${gw_cpu}% CPU; it should be near idle (DNS loop?)."
+fi
 
 # --------------------------------------------------------------------------
 # Kill switch
