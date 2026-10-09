@@ -6,10 +6,7 @@ A Proxmox VE helper script to automate deployment and configuration of a basic c
 
 ## What is Included
 
-### New Development...
-- **Glutun** (VPN Gateway container!!!)
-
-### Working
+### Apps
 - **Prowlarr** (indexers)
 - **Sonarr** (TV)
 - **Radarr** (movies)
@@ -49,16 +46,13 @@ Derived from [@michelroegl-brunner's](https://github.com/michelroegl-brunner) or
 To use this version, manually download to your PVE host and run it.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/JVKeller/arr-script/glutun-gateway/installarr.sh -o installarr.sh
+curl -fsSL https://raw.githubusercontent.com/JVKeller/arr-script/main/installarr.sh -o installarr.sh
 bash installarr.sh
 ```
 
 ## Recommendations
-It is highly recommended to use a VPN for your arr-stack traffic. This version does not have a VPN set up with it, so
-you would be on your own to set that up.
-
-If you would like the add the addition of a Gluten VPN container to route your traffic though and keep your data private,
-Please switch to the Glutun branch to integrate a VPN service like Surfshark while it's being finalized.
+It is highly recommended to use a VPN for your arr-stack traffic. To route it through one and keep your data private,
+choose the optional Gluetun VPN gateway container when prompted (see [VPN Gateway](#vpn-gateway-optional)).
 
 ### Environment Variables (Optional)
 
@@ -130,7 +124,8 @@ pct exec <gluetun-ctid> -- nano /opt/gluetun-data/.env
 pct exec <gluetun-ctid> -- chmod 600 /opt/gluetun-data/.env
 ```
 
-At minimum set `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, and your credentials. For WireGuard that
+First remove the helper script's default `OPENVPN_*` and `VPN_SERVICE_PROVIDER=custom`
+entries. Then set `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, and your credentials. For WireGuard that
 means `WIREGUARD_PRIVATE_KEY` and `WIREGUARD_ADDRESSES`.
 
 > **`WIREGUARD_ADDRESSES` must be the address *and prefix* from your provider's config**
@@ -156,9 +151,11 @@ pct exec <gluetun-ctid> -- journalctl -u gluetun -n 50   # if nothing matches
 
 Reads `/root/installarr-state.conf`, and **refuses to run until step 2 succeeds**. For each
 member it sets the default route to the gateway, keeps the LAN address on a second NIC for
-management, points DNS at the gateway, and staggers boot order. Then it verifies: one default
-route via the gateway, every member egressing the same address, reverse-path filtering, and a
-kill-switch test that stops Gluetun and confirms nothing reaches WAN.
+management, points DNS at the gateway (clearing the inherited search domain, which can cause a
+DNS loop), and staggers boot order. Then it verifies: one default route via the gateway,
+reverse-path filtering, the management route service, DNS resolution, every member egressing
+the same address as the gateway, no `[dns]` warnings or CPU spin in Gluetun, and a kill-switch
+test that stops Gluetun and confirms nothing reaches WAN.
 
 Safe to re-run at any time â€” every step is idempotent, and re-running is how you re-verify.
 Pass `-y` to skip the confirmation prompt.
@@ -182,6 +179,7 @@ Point each container's `net0` back at the LAN bridge:
 pct set <ctid> -net0 name=eth0,bridge=vmbr0,gw=<lan-gw>,ip=<lan-ip>/24,type=veth
 pct set <ctid> -delete net1
 pct set <ctid> -delete nameserver
+pct set <ctid> -delete searchdomain
 pct reboot <ctid>
 ```
 
@@ -245,9 +243,15 @@ It found no `wg`/`tun` interface in the Gluetun container. That is deliberate â€
 has no uplink, so converting containers without a tunnel would cut their internet entirely.
 Finish the provider setup first.
 
+### Gluetun CPU is high or DNS lookups fail
+Look for `[dns]` warnings: `pct exec <gluetun-ctid> -- journalctl -u gluetun --since '5 minutes ago' | grep dns`.
+Every routed container and the gateway must have an empty search domain
+(`pct config <ctid>` should show no `searchdomain`); re-run `/root/installarr-vpn.sh` to reapply it.
+
 ### Web UI unreachable after the cutover
 Check the container kept its LAN NIC: `pct config <ctid>` should show `net1` on the LAN bridge
-with no `gw=`. Only `net0` carries a default route.
+with no `gw=`. Only `net0` carries a default route. If you use a management subnet, also check
+`pct exec <ctid> -- systemctl status mgmt-route.service`; it retries until the LAN gateway is reachable.
 
 ### Downloads stall at 0% but the web UI loads
 The MSS clamp is missing. Run

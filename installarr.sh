@@ -39,9 +39,7 @@ STATE_FILE="${STATE_FILE:-/root/installarr-state.conf}"
 # Helper files are fetched from this repo at the same ref as the installer,
 # so a pinned installer never pairs itself with a drifted helper.
 var_installarr_repo="${var_installarr_repo:-JVKeller/arr-script}"
-# NOTE: while this feature lives on the glutun-gateway branch, the helper files
-# do not exist on main. Set this back to "main" when the branch is merged.
-var_installarr_ref="${var_installarr_ref:-glutun-gateway}"
+var_installarr_ref="${var_installarr_ref:-main}"
 # Read by upstream set_std_mode(): "yes" leaves STD empty so output streams.
 VERBOSE="${VERBOSE:-no}"
 
