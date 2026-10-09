@@ -35,6 +35,13 @@ var_start_ctid="${var_start_ctid:-}"
 var_repo="${var_repo:-ProxmoxVE}"
 var_qbt_password="${var_qbt_password:-}"
 SUMMARY_FILE="${SUMMARY_FILE:-/root/installarr-summary.txt}"
+STATE_FILE="${STATE_FILE:-/root/installarr-state.conf}"
+# Helper files are fetched from this repo at the same ref as the installer,
+# so a pinned installer never pairs itself with a drifted helper.
+var_installarr_repo="${var_installarr_repo:-JVKeller/arr-script}"
+# NOTE: while this feature lives on the glutun-gateway branch, the helper files
+# do not exist on main. Set this back to "main" when the branch is merged.
+var_installarr_ref="${var_installarr_ref:-glutun-gateway}"
 # Read by upstream set_std_mode(): "yes" leaves STD empty so output streams.
 VERBOSE="${VERBOSE:-no}"
 
@@ -44,6 +51,16 @@ VERBOSE="${VERBOSE:-no}"
 INSTALL_MODE="${INSTALL_MODE:-}"
 
 QBT_PERMANENT=0
+
+# All five are replaced by installarr-vpn.func when the user opts into the VPN
+# gateway. main() calls them unconditionally, so they must exist even when the
+# module is never fetched -- otherwise declining the VPN trips `set -e`.
+VPN_ENABLED=0
+vpn_prompt_settings()   { :; }
+vpn_plan_addresses()    { :; }
+vpn_ensure_bridge()     { :; }
+vpn_configure_gateway() { :; }
+vpn_summary_lines()     { :; }
 
 BACKTITLE="Proxmox VE Helper Scripts — Installarr"
 
@@ -317,6 +334,7 @@ seerr|seerr.sh|5055||-|requests|Seerr|
 jellyfin|jellyfin.sh|8096|Jellyfin|-|media|Jellyfin|
 qbittorrent|qbittorrent.sh|8090|QBittorrent|-|client|qBittorrent|QBittorrentSettings
 sabnzbd|sabnzbd.sh|7777|Sabnzbd|-|client|SABnzbd|SabnzbdSettings
+gluetun|gluetun.sh|8000|||vpn|Gluetun|
 EOF
 }
 
@@ -592,8 +610,65 @@ pick_qbittorrent_password() {
   done
 }
 
+# Fetched only after the user opts in, mirroring how core.func/tools.func are
+# sourced at the top of this file. installarr-vpn.sh is left on disk for the
+# operator to run later -- the summary tells them to.
+pick_vpn() {
+  local base="https://raw.githubusercontent.com/${var_installarr_repo}/${var_installarr_ref}"
+
+  if ! curl -fsSL "${base}/installarr-vpn.func" -o "$TEMP_DIR/installarr-vpn.func"; then
+    msg_warn "Could not fetch installarr-vpn.func; skipping the VPN gateway option."
+    return 0
+  fi
+  # shellcheck source=/dev/null
+  source "$TEMP_DIR/installarr-vpn.func"
+
+  vpn_prompt_settings
+  (( VPN_ENABLED )) || return 0
+
+  if curl -fsSL "${base}/installarr-vpn.sh" -o /root/installarr-vpn.sh; then
+    chmod +x /root/installarr-vpn.sh
+    msg_ok "Post-install script saved to /root/installarr-vpn.sh"
+  else
+    msg_warn "Could not fetch installarr-vpn.sh -- download it manually before finishing VPN setup."
+  fi
+}
+
+# Written on every run, VPN or not: a machine-readable record of what was built,
+# so the stack can be extended later without re-running the installer.
+write_state() {
+  local s
+  {
+    echo "# Written by installarr.sh on $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo "LAN_BRIDGE=${var_bridge}"
+    echo "LAN_GW=${var_gateway}"
+    echo "LAN_CIDR=${var_cidr}"
+    echo "LAN_VLAN=${var_vlan}"
+    echo "VPN_ENABLED=${VPN_ENABLED}"
+    echo "VPN_BRIDGE=${VPN_BRIDGE:-}"
+    echo "VPN_GW=${VPN_GW:-}"
+    echo "VPN_MASK=${VPN_MASK:-}"
+    echo "VPN_SUBNET=${VPN_SUBNET:-}"
+    echo "VPN_MGMT_SUBNET=${VPN_MGMT_SUBNET:-}"
+    echo "GLUETUN_CTID=${APP[gluetun.ctid]:-}"
+    echo "GLUETUN_LAN_IP=${APP[gluetun.ip]:-}"
+    # slug:ctid:lan_ip:port:kind:planned_vpn_ip -- the VPN address is empty for
+    # anything that is not a tunnel member, and for every container when no VPN
+    # was configured. installarr-vpn.sh treats a non-empty one as "convert me".
+    printf 'CONTAINERS="'
+    for s in "${ORDERED_SLUGS[@]}"; do
+      printf '%s:%s:%s:%s:%s:%s '         "$s" "${APP[$s.ctid]:-}" "${APP[$s.ip]:-}" "${APP[$s.port]:-}"         "${APP[$s.kind]:-}" "${APP[$s.vpnip]:-}"
+    done
+    echo '"'
+  } >"$STATE_FILE"
+  chmod 600 "$STATE_FILE"
+  msg_ok "Wrote ${STATE_FILE}"
+}
+
 compute_ordered_slugs() {
-  ORDERED_SLUGS=("prowlarr")
+  ORDERED_SLUGS=()
+  (( VPN_ENABLED )) && ORDERED_SLUGS+=("gluetun")
+  ORDERED_SLUGS+=("prowlarr")
   local s
   for s in $SELECTED_ARRS; do
     [[ "$s" == "seerr" ]] && continue
@@ -631,197 +706,127 @@ pick_ip_mode_and_ips() {
   done
 }
 
+# Validation shared by every IP entry mode. check_live gates the reachability
+# probe: the two form modes ping before accepting, list mode never has.
+_validate_ip_set() {
+  local check_live=$1; shift
+  local -a ips=("$@")
+  local expected_n=${#ORDERED_SLUGS[@]}
+  local i ip dup
+
+  if (( ${#ips[@]} != expected_n )); then
+    whiptail --backtitle "$BACKTITLE" --title "Wrong count"       --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
+    return 1
+  fi
+
+  for i in "${!ips[@]}"; do
+    ip="${ips[$i]}"
+    if ! is_valid_ipv4 "$ip"; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid"         --msgbox "Entry $((i+1)) is not a valid IPv4: ${ip}" 8 60
+      return 1
+    fi
+    if [[ "$ip" == "$var_gateway" ]]; then
+      whiptail --backtitle "$BACKTITLE" --title "Invalid"         --msgbox "Entry $((i+1)) collides with the gateway: ${ip}" 8 60
+      return 1
+    fi
+    if (( check_live )) && ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+      whiptail --backtitle "$BACKTITLE" --title "IP In Use"         --msgbox "Entry $((i+1)) is already in use by another device: ${ip}" 8 60
+      return 1
+    fi
+  done
+
+  dup=$(printf '%s
+' "${ips[@]}" | sort | uniq -d | head -n1)
+  if [[ -n "$dup" ]]; then
+    whiptail --backtitle "$BACKTITLE" --title "Duplicate IP"       --msgbox "IP appears more than once: ${dup}" 8 60
+    return 1
+  fi
+
+  return 0
+}
+
+# Runs whichever form UI is available and emits one IP per line. The dialog and
+# whiptail forms differ only in the invocation and its fd plumbing.
+# Returns 1 if the user cancelled, 2 if neither UI supports --form (the caller
+# then falls back to one inputbox per container).
+_run_ip_form() {
+  local ui expected_n=${#ORDERED_SLUGS[@]}
+  local -a form_fields=()
+  local slug
+  ui=$(form_input_program)
+
+  for slug in "${ORDERED_SLUGS[@]}"; do
+    form_fields+=("$slug" "")
+  done
+
+  case "$ui" in
+    dialog)
+      dialog --backtitle "$BACKTITLE"         --title "Container IP Addresses"         --form "Enter an IPv4 address for each container:" 22 78 0         "${form_fields[@]}" 2>&1 >/dev/tty || return 1
+      ;;
+    whiptail)
+      whiptail --backtitle "$BACKTITLE"         --title "Container IP Addresses"         --separate-output         --form "Enter an IPv4 address for each container:" 22 78 "$((expected_n + 4))"         "${form_fields[@]}" 3>&1 1>&2 2>&3 || return 1
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+_assign_ips_in_order() {
+  local -a ips=("$@")
+  local i
+  for i in "${!ORDERED_SLUGS[@]}"; do
+    APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
+  done
+}
+
 _collect_ips_list_mode() {
   local expected_n=${#ORDERED_SLUGS[@]}
   local hint="" s
-  for s in "${ORDERED_SLUGS[@]}"; do hint+="  ${s}"$'\n'; done
+  for s in "${ORDERED_SLUGS[@]}"; do hint+="  ${s}"$'
+'; done
 
   while true; do
     local raw
-    raw=$(whiptail --backtitle "$BACKTITLE" \
-      --title "Enter ${expected_n} IPv4 addresses" \
-      --inputbox "Enter ${expected_n} IPs separated by spaces or commas, in this order:"$'\n\n'"${hint}" \
-      22 78 "" 3>&1 1>&2 2>&3) || cancelled "IP list entry"
+    raw=$(whiptail --backtitle "$BACKTITLE"       --title "Enter ${expected_n} IPv4 addresses"       --inputbox "Enter ${expected_n} IPs separated by spaces or commas, in this order:"$'
+
+'"${hint}"       22 78 "" 3>&1 1>&2 2>&3) || cancelled "IP list entry"
 
     local normalized="${raw//,/ }"
     local -a ips=()
     # shellcheck disable=SC2206
     ips=( $normalized )
 
-    if (( ${#ips[@]} != expected_n )); then
-      whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
-        --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
-      continue
-    fi
+    _validate_ip_set 0 "${ips[@]}" || continue
 
-    local ok=1 i
-    for i in "${!ips[@]}"; do
-      if ! is_valid_ipv4 "${ips[$i]}"; then
-        whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-          --msgbox "Entry $((i+1)) is not a valid IPv4: ${ips[$i]}" 8 60
-        ok=0; break
-      fi
-      if [[ "${ips[$i]}" == "$var_gateway" ]]; then
-        whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-          --msgbox "Entry $((i+1)) collides with the gateway: ${ips[$i]}" 8 60
-        ok=0; break
-      fi
-    done
-    (( ok == 0 )) && continue
-
-    local dup
-    dup=$(printf '%s\n' "${ips[@]}" | sort | uniq -d | head -n1)
-    if [[ -n "$dup" ]]; then
-      whiptail --backtitle "$BACKTITLE" --title "Duplicate IP" \
-        --msgbox "IP appears more than once: ${dup}" 8 60
-      continue
-    fi
-
-    for i in "${!ORDERED_SLUGS[@]}"; do
-      APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
-    done
+    _assign_ips_in_order "${ips[@]}"
     return
   done
 }
 
 _collect_ips_one_by_one() {
-  local ui
-  ui=$(form_input_program)
+  local raw_values rc
+  local -a ips=()
 
-  if [[ "$ui" == "dialog" ]]; then
-    local expected_n=${#ORDERED_SLUGS[@]}
-    local -a form_fields=()
-    local slug
+  while true; do
+    rc=0
+    raw_values=$(_run_ip_form) || rc=$?
 
-    for slug in "${ORDERED_SLUGS[@]}"; do
-      form_fields+=("$slug" "")
-    done
+    # No --form-capable UI: drop to the one-inputbox-per-container loop below.
+    (( rc == 2 )) && break
 
-    while true; do
-      local raw_values
-      if ! raw_values=$(dialog --backtitle "$BACKTITLE" \
-        --title "Container IP Addresses" \
-        --form "Enter an IPv4 address for each container:" 22 78 0 \
-        "${form_fields[@]}" 2>&1 >/dev/tty); then
-        msg_warn "IP form entry cancelled."
-        return 1
-      fi
+    if (( rc != 0 )); then
+      msg_warn "IP form entry cancelled."
+      return 1
+    fi
 
-      local -a ips=()
-      mapfile -t ips <<< "$raw_values"
+    mapfile -t ips <<< "$raw_values"
 
-      if (( ${#ips[@]} != expected_n )); then
-        whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
-          --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
-        continue
-      fi
+    _validate_ip_set 1 "${ips[@]}" || continue
 
-      local ok=1 i
-      for i in "${!ips[@]}"; do
-        local ip="${ips[$i]}"
-        if ! is_valid_ipv4 "$ip"; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) is not a valid IPv4: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if [[ "$ip" == "$var_gateway" ]]; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) collides with the gateway: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-          whiptail --backtitle "$BACKTITLE" --title "IP In Use" \
-            --msgbox "Entry $((i+1)) is already in use by another device: ${ip}" 8 60
-          ok=0
-          break
-        fi
-      done
-      (( ok == 0 )) && continue
-
-      local dup
-      dup=$(printf '%s\n' "${ips[@]}" | sort | uniq -d | head -n1)
-      if [[ -n "$dup" ]]; then
-        whiptail --backtitle "$BACKTITLE" --title "Duplicate IP" \
-          --msgbox "IP appears more than once: ${dup}" 8 60
-        continue
-      fi
-
-      for i in "${!ORDERED_SLUGS[@]}"; do
-        APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
-      done
-      return 0
-    done
-  fi
-
-  if [[ "$ui" == "whiptail" ]]; then
-    local expected_n=${#ORDERED_SLUGS[@]}
-    local -a form_fields=()
-    local slug
-
-    for slug in "${ORDERED_SLUGS[@]}"; do
-      form_fields+=("$slug" "")
-    done
-
-    while true; do
-      local raw_values
-      if ! raw_values=$(whiptail --backtitle "$BACKTITLE" \
-        --title "Container IP Addresses" \
-        --separate-output \
-        --form "Enter an IPv4 address for each container:" 22 78 "$((expected_n + 4))" \
-        "${form_fields[@]}" 3>&1 1>&2 2>&3); then
-        msg_warn "IP form entry cancelled."
-        return 1
-      fi
-
-      local -a ips=()
-      mapfile -t ips <<< "$raw_values"
-
-      if (( ${#ips[@]} != expected_n )); then
-        whiptail --backtitle "$BACKTITLE" --title "Wrong count" \
-          --msgbox "Expected ${expected_n} IPs, got ${#ips[@]}. Please re-enter." 8 60
-        continue
-      fi
-
-      local ok=1 i
-      for i in "${!ips[@]}"; do
-        local ip="${ips[$i]}"
-        if ! is_valid_ipv4 "$ip"; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) is not a valid IPv4: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if [[ "$ip" == "$var_gateway" ]]; then
-          whiptail --backtitle "$BACKTITLE" --title "Invalid" \
-            --msgbox "Entry $((i+1)) collides with the gateway: ${ip}" 8 60
-          ok=0
-          break
-        fi
-        if ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
-          whiptail --backtitle "$BACKTITLE" --title "IP In Use" \
-            --msgbox "Entry $((i+1)) is already in use by another device: ${ip}" 8 60
-          ok=0
-          break
-        fi
-      done
-      (( ok == 0 )) && continue
-
-      local dup
-      dup=$(printf '%s\n' "${ips[@]}" | sort | uniq -d | head -n1)
-      if [[ -n "$dup" ]]; then
-        whiptail --backtitle "$BACKTITLE" --title "Duplicate IP" \
-          --msgbox "IP appears more than once: ${dup}" 8 60
-        continue
-      fi
-
-      for i in "${!ORDERED_SLUGS[@]}"; do
-        APP[${ORDERED_SLUGS[$i]}.ip]=${ips[$i]}
-      done
-      return 0
-    done
-  fi
+    _assign_ips_in_order "${ips[@]}"
+    return 0
+  done
 
   local slug ip running="" last_ip="" default_ip=""
   for slug in "${ORDERED_SLUGS[@]}"; do
@@ -1648,6 +1653,11 @@ write_summary() {
   lines+=( "\e[1;31m------------------------------------------------------------\e[0m" )
   lines+=( "" )
   lines+=( "Summary written to \e[36m${SUMMARY_FILE}\e[0m (chmod 600)." )
+  if (( VPN_ENABLED )); then
+    local vpn_line
+    while IFS= read -r vpn_line; do lines+=( "$vpn_line" ); done < <(vpn_summary_lines)
+  fi
+
   lines+=( "\e[1;36m============================================================\e[0m" )
 
   local body
@@ -1682,15 +1692,20 @@ main() {
   pick_jellyfin
   pick_qbittorrent_password
   pick_example_indexer
+  pick_vpn
   compute_ordered_slugs
   pick_ip_mode_and_ips
   pick_ctids
   pick_verbose
+  vpn_plan_addresses
+  vpn_ensure_bridge
   confirm_summary
   prepare_templates
   install_loop
+  vpn_configure_gateway
   wait_and_extract_keys
   wire_apis
+  write_state
   write_summary
   msg_ok "Installarr provisioning finished."
 }
