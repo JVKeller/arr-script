@@ -1266,20 +1266,22 @@ record_failure() { WIRING_FAILURES+=("$1"); }
 api_post() {
   local url=$1 apikey=$2 payload=$3 label=$4
   local resp status=""
-  resp=$(curl -fsS --max-time 30 --retry 2 \
+  resp=$(curl -sS --max-time 30 --retry 2 \
     -H "X-Api-Key: $apikey" \
     -H "Content-Type: application/json" \
     -X POST "$url" -d "$payload" \
     -w '\n__HTTP__%{http_code}' 2>&1) || status="curl_fail"
 
-  local code=""
+  local code="" body=""
   if [[ "$resp" =~ __HTTP__([0-9]+)$ ]]; then
     code="${BASH_REMATCH[1]}"
+    body="${resp%$'\n'__HTTP__"$code"}"
   fi
 
   if [[ "$status" == "curl_fail" || -z "$code" || "$code" -ge 400 ]]; then
     record_failure "${label}  FAIL (http ${code:-?})"
     msg_warn "${label} failed (http ${code:-?})"
+    [[ -n "$body" ]] && msg_warn "  response: ${body}"
     return 1
   fi
   record_wiring "${label}  OK"
